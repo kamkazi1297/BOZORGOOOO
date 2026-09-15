@@ -1,0 +1,36 @@
+{
+  "url": "http://127.0.0.1:8080/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "Apex Desk",
+      "hasCanvas": false,
+      "bodyTextLen": 3270,
+      "bodyTextHash": "33154eb4040286ab276495b398f7ddaaa875961c386e83e5c93f2b6634e95618",
+      "bodyTextPrefix": "A میز اپکس ورود مکانیکی APEX + کویل HALCYON + TREX + KETEX + SHE",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "Apex Desk",
+      "hasCanvas": false,
+      "bodyTextLen": 3148,
+      "bodyTextHash": "e48735f5d8f354bfb12e2d2f9cc99fea07358cec94baf7a27955d3417371673e",
+      "bodyTextPrefix": "A میز اپکس EN میز سیگنال‌ها ژورنال آنالیز جهان ارز صرافی‌ها موتو",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-preview.json"
+}

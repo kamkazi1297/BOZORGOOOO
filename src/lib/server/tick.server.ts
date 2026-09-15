@@ -1,0 +1,1390 @@
+import { fetchKlinesCached } from "@/lib/market/klines";
+import { FALLBACK_UNIVERSE, fetchUniverse, fetchVenueUniverse, filterByMinCap, minCapUsd, looksLikeFallbackUniverse } from "@/lib/market/universe";
+import { fetchVenueLastPrice } from "@/lib/market/venues";
+import { onlyClosedBars, scanBarClosed } from "@/lib/engine/run";
+import { parseEngineGates, parseSideGates, scanNames, isSideOn } from "@/lib/engine/engine-gates";
+import { origStopPx, pathExcursion, pnlAt, rebaseStopsFromFill, closeFromVenueTrades, sizePosition, walkPath } from "@/lib/engine/paper";
+import { capitalPctForLeverage, DEFAULT_CAPITAL_PCT, parseLevSizeTiers } from "@/lib/engine/lev-size";
+import { FEE_BPS, HTF2_OF, HTF_OF, TF_MS, WARMUP, type KlineTf, type Timeframe, type VenueId } from "@/lib/engine/types";
+import {
+  dueTimeframes,
+  interleaveSlices,
+  isFreshSignal,
+  latestClosedOpen,
+  nextTfCursor,
+  parseCursors,
+  prefixCompleted,
+  scanLastN,
+  type TfCursor,
+} from "@/lib/engine/scan-schedule";
+import { bookVenue, chartHostLabel, getAdapter, resolveMaxLeverage, sameCoin, venueSymbol } from "@/lib/exchanges/registry";
+import { venueMaxLeverage, loadPublicLeverageMaps } from "@/lib/exchanges/leverage";
+import { capLeverage, stackedUserLevCap } from "@/lib/exchanges/lev-cap";
+import type { ExchangeAccount, ExchangeAdapter, PlaceOrderResult, ProtectionSnapshot } from "@/lib/exchanges/types";
+import {
+  alreadyFilled,
+  acquireTickLock,
+  bumpEquity,
+  closePosition,
+  dropOrphanFill,
+  getSettings,
+  heartbeatTickLock,
+  insertPosition,
+  insertSignal,
+  listOpenPositions,
+  listOrphanFills,
+  listUniverse,
+  logScan,
+  publicSettings,
+  rememberOrphanFill,
+  releaseTickLock,
+  replaceUniverse,
+  setEquity,
+  setScanCursor,
+  setUniverseVenue,
+  snapshotEquity,
+  touchTick,
+  updatePositionSl,
+  markScanProgress,
+  type PositionRow,
+  type SettingsRow,
+} from "./desk.server";
+import { trexBeAtR } from "@/lib/engine/trex";
+
+const SCAN_BARS = 360;
+const MIN_BARS = WARMUP + 12;
+const SCAN_CONCURRENCY = 16;
+const MAX_BATCH = 250;
+const UNIVERSE_TTL_MS = 30 * 60_000;
+const LOCK_HEARTBEAT_MS = 5_000;
+
+export function tickBudgetMs() {
+  const override = Number(process.env.TICK_BUDGET_MS);
+  if (Number.isFinite(override) && override >= 3_000) return Math.min(55_000, override);
+  if (process.env.VERCEL) {
+    const cap = Number(process.env.VERCEL_MAX_DURATION);
+    if (Number.isFinite(cap) && cap >= 15) return Math.min(55_000, cap * 1000 - 2_000);
+    return 8_000;
+  }
+  return 45_000;
+}
+
+type StampedAsset = Awaited<ReturnType<typeof fetchVenueUniverse>>[number];
+let universeCache: { at: number; venue: VenueId; assets: StampedAsset[] } | null = null;
+
+export function clearUniverseCache() {
+  universeCache = null;
+}
+
+export function hasLiveKeys(s: SettingsRow, venue: VenueId) {
+  if (venue === "hyperliquid") {
+    const w = (s.hyperliquid_wallet_address ?? "").trim();
+    return Boolean(s.hyperliquid_private_key) && /^0x[0-9a-fA-F]{40}$/.test(w);
+  }
+  if (venue === "lighter") return Boolean(s.lighter_api_private_key && s.lighter_account_index != null);
+  if (venue === "aster") {
+    const pk = (s.aster_api_secret ?? "").trim();
+    if (/^(0x)?[0-9a-fA-F]{64}$/.test(pk)) return true;
+    return Boolean(s.aster_api_key && s.aster_api_secret);
+  }
+  if (venue === "ourbit") return Boolean(s.ourbit_api_key && s.ourbit_api_secret);
+  return false;
+}
+
+export function accountFrom(s: SettingsRow, venue: VenueId): ExchangeAccount {
+  if (venue === "aster") {
+    return {
+      venue,
+      apiKey: s.aster_api_key ?? undefined,
+      apiSecret: s.aster_api_secret ?? undefined,
+      walletAddress: s.aster_api_key ?? undefined,
+      privateKey: s.aster_api_secret ?? undefined,
+    };
+  }
+  if (venue === "ourbit") {
+    return { venue, apiKey: s.ourbit_api_key ?? undefined, apiSecret: s.ourbit_api_secret ?? undefined };
+  }
+  if (venue === "hyperliquid") {
+    return {
+      venue,
+      privateKey: s.hyperliquid_private_key ?? undefined,
+      walletAddress: s.hyperliquid_wallet_address ?? undefined,
+    };
+  }
+  return {
+    venue: "lighter",
+    apiKey: s.lighter_api_key ?? undefined,
+    privateKey: s.lighter_api_private_key ?? undefined,
+    accountIndex: s.lighter_account_index ?? undefined,
+    apiKeyIndex: s.lighter_api_key_index ?? 2,
+  };
+}
+
+const ORPHAN_MARK = "UNPROTECTED flatten failed";
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("timeout")), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
+}
+
+/** Overlay live venue balance / fill onto the desk payload. Style unchanged. */
+export async function overlayLiveSnapshot<T extends { mode: string; venue: string; liveEnabled: boolean; equityUsd: number }>(
+  settings: T,
+  open: PositionRow[],
+): Promise<{ settings: T; open: PositionRow[] }> {
+  const venue = bookVenue(settings.venue);
+  if (settings.mode !== "live" || venue === "paper") {
+    return { settings, open };
+  }
+  const row = await getSettings().catch(() => null);
+  if (!row || !hasLiveKeys(row, venue)) return { settings, open };
+  const adapter = getAdapter(venue);
+  if (!adapter) return { settings, open };
+  const acc = accountFrom(row, venue);
+  let next = settings;
+  try {
+    const bal = await withTimeout(adapter.fetchBalance(acc), 5000);
+    if (bal != null && Number.isFinite(bal)) {
+      next = { ...next, equityUsd: bal };
+      await setEquity(bal).catch(() => undefined);
+    }
+  } catch {
+    /* keep stored equity */
+  }
+  if (!open.length) return { settings: next, open };
+  try {
+    const vpos = await withTimeout(adapter.fetchPositions(acc), 5000);
+    const mapped = open.map((p) => {
+      const hit = vpos.find((x) => sameCoin(x.symbol, p.symbol) || sameCoin(x.symbol, venueSymbol(venue, p.symbol)));
+      if (!hit) return p;
+      return {
+        ...p,
+        entry: hit.entry > 0 ? hit.entry : p.entry,
+        qty: hit.qty > 0 ? hit.qty : p.qty,
+        leverage: hit.leverage > 0 ? hit.leverage : p.leverage,
+        pnl_usd: Number.isFinite(hit.upl) ? hit.upl : p.pnl_usd,
+      };
+    });
+    return { settings: next, open: mapped };
+  } catch {
+    return { settings: next, open };
+  }
+}
+
+async function resolveLiveExit(
+  adapter: ExchangeAdapter,
+  acc: ExchangeAccount,
+  venue: VenueId,
+  pos: {
+    symbol: string;
+    side: string;
+    entry: number | string;
+    sl: number | string;
+    orig_sl?: number | null;
+    qty: number | string;
+    risk_usd: number | string;
+    fees_usd: number | string;
+    opened_at: string;
+  },
+  fallbackPx: number,
+) {
+  const side = pos.side as "long" | "short";
+  const entry = Number(pos.entry);
+  const origPx = origStopPx({
+    side,
+    entry,
+    sl: Number(pos.sl),
+    origSl: pos.orig_sl,
+    qty: Number(pos.qty),
+    risk: Number(pos.risk_usd),
+  });
+  const slDist = Math.abs(entry - origPx);
+  let exit = fallbackPx;
+  let pnl: number | null = null;
+  if (adapter.fetchTrades) {
+    try {
+      const openedAt = new Date(pos.opened_at).getTime();
+      const trades = await adapter.fetchTrades(acc, {
+        symbol: venueSymbol(venue, pos.symbol),
+        startTime: Math.max(0, openedAt - 15_000),
+      });
+      const hit = closeFromVenueTrades({ side, entry, trades, openedAt });
+      if (hit) {
+        exit = hit.exit;
+        pnl = hit.pnl;
+      }
+    } catch {
+      /* paper fallback */
+    }
+  }
+  if (pnl == null) {
+    pnl = pnlAt(side, entry, exit, Number(pos.qty), Number(pos.fees_usd));
+  }
+  const pnlR = slDist > 0 ? (side === "long" ? exit - entry : entry - exit) / slDist : 0;
+  return { exit, pnl, pnlR };
+}
+
+async function confirmLiveFill(
+  adapter: ExchangeAdapter,
+  acc: ExchangeAccount,
+  symbol: string,
+  sl: number,
+  tp: number,
+  orderId?: string,
+): Promise<PlaceOrderResult> {
+  let last: ProtectionSnapshot = { onVenue: false, hasSl: false, hasTp: false, unknown: true };
+  for (let i = 0; i < 5; i++) {
+    try {
+      last = await adapter.fetchProtection(acc, { symbol, sl, tp });
+      if (!last.unknown && last.onVenue && last.hasSl && last.hasTp) {
+        return { ok: true, orderId, message: "fill confirmed · SL/TP on venue" };
+      }
+      if (!last.unknown && !last.onVenue) break;
+    } catch {
+      last = { onVenue: false, hasSl: false, hasTp: false, unknown: true };
+    }
+    if (i < 4) await sleep(400);
+  }
+  const why = last.unknown
+    ? "live fill unconfirmed (venue read failed)"
+    : !last.onVenue
+      ? "live fill not on venue"
+      : `live fill missing ${[!last.hasSl && "SL", !last.hasTp && "TP"].filter(Boolean).join("+")}`;
+  try {
+    const closed = await adapter.closePosition(acc, symbol);
+    const flat = closed.ok || closed.message === "flat";
+    if (flat) return { ok: false, orderId, message: `${why} — flattened, no unprotected position left` };
+    return { ok: false, liveOpen: true, orderId, message: `${why} — flatten failed (${closed.message})` };
+  } catch (e) {
+    return {
+      ok: false,
+      liveOpen: true,
+      orderId,
+      message: `${why} — flatten failed (${e instanceof Error ? e.message : "close threw"})`,
+    };
+  }
+}
+
+function isOrphanPosition(pos: { signal_reason?: string | null }) {
+  return typeof pos.signal_reason === "string" && pos.signal_reason.includes(ORPHAN_MARK);
+}
+
+async function mapPool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = [];
+  let i = 0;
+  async function worker() {
+    while (i < items.length) {
+      const idx = i++;
+      out[idx] = await fn(items[idx]!);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+  return out;
+}
+
+function resolveBatch(raw: number, universeLen: number) {
+  if (!universeLen) return 0;
+  if (!Number.isFinite(raw) || raw <= 0) return Math.min(MAX_BATCH, universeLen);
+  return Math.min(MAX_BATCH, universeLen, Math.max(1, Math.round(raw)));
+}
+
+export async function refreshUniverse(minMcap: number, venue: VenueId = "paper", force = false) {
+  const floor = minCapUsd(minMcap);
+  const book = bookVenue(venue);
+  if (
+    !force &&
+    universeCache &&
+    universeCache.venue === book &&
+    Date.now() - universeCache.at < UNIVERSE_TTL_MS &&
+    universeCache.assets.length
+  ) {
+    return filterByMinCap(universeCache.assets, floor, (a) => a.marketCapUsd);
+  }
+  let listed: StampedAsset[] = [];
+  let listedErr: Error | null = null;
+  try {
+    listed = await fetchVenueUniverse(book, force);
+  } catch (e) {
+    listedErr = e instanceof Error ? e : new Error(`${book} listed markets empty`);
+    listed = [];
+  }
+  if (!listed.length && universeCache && universeCache.venue === book && universeCache.assets.length) {
+    return filterByMinCap(universeCache.assets, floor, (a) => a.marketCapUsd);
+  }
+  if (!listed.length) {
+    const existing = await listUniverse().catch(() => []);
+    const stored = await getSettings().catch(() => null);
+    const storedVenue = stored?.universe_venue ? bookVenue(stored.universe_venue) : null;
+    if (existing.length && storedVenue === book) {
+      return filterByMinCap(
+        existing.map((a) => ({
+          symbol: a.symbol,
+          base: a.base,
+          name: a.name,
+          marketCapUsd: Number(a.market_cap_usd),
+          volume24hUsd: Number(a.volume_24h_usd),
+          maxLeverage: Number(a.max_leverage),
+          venueSymbol: a.venue_symbol ?? a.symbol,
+        })),
+        floor,
+        (a) => a.marketCapUsd,
+      );
+    }
+    if (book === "paper") {
+      try {
+        listed = await fetchUniverse(0);
+      } catch {
+        listed = [];
+      }
+      if (!listed.length) listed = FALLBACK_UNIVERSE.slice();
+    } else if (!listed.length) {
+      throw listedErr ?? new Error(`${book} listed markets empty`);
+    }
+  }
+  try {
+    await loadPublicLeverageMaps();
+  } catch {
+    /* stamp with defaults */
+  }
+  const stamped = await Promise.all(
+    listed.map(async (a) => ({
+      ...a,
+      maxLeverage: a.maxLeverage > 0 ? capLeverage(a.maxLeverage) : await venueMaxLeverage(book, a.symbol),
+    })),
+  );
+  await replaceUniverse(stamped);
+  if (looksLikeFallbackUniverse(stamped)) {
+    universeCache = null;
+    await setUniverseVenue("");
+  } else {
+    await setUniverseVenue(book);
+    universeCache = { at: Date.now(), venue: book, assets: stamped };
+  }
+  return filterByMinCap(stamped, floor, (a) => a.marketCapUsd);
+}
+
+export async function restampUniverseLeverage(venue: VenueId) {
+  const rows = await listUniverse();
+  if (!rows.length) return [];
+  const stamped = await Promise.all(
+    rows.map(async (a) => ({
+      symbol: a.symbol,
+      base: a.base,
+      name: a.name,
+      marketCapUsd: Number(a.market_cap_usd),
+      volume24hUsd: Number(a.volume_24h_usd),
+      maxLeverage: await venueMaxLeverage(venue, a.symbol),
+      venueSymbol: a.venue_symbol ?? a.symbol,
+    })),
+  );
+  await replaceUniverse(stamped);
+  await setUniverseVenue(venue);
+  return stamped;
+}
+
+export async function runTick(opts?: { forceUniverse?: boolean; batch?: number; source?: string }) {
+  const t0 = Date.now();
+  const source = opts?.source ?? "manual";
+  const lock = await acquireTickLock();
+  if (!lock) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: "tick already running",
+      public: publicSettings(await getSettings()),
+    };
+  }
+  const hb = setInterval(() => {
+    void heartbeatTickLock(lock);
+  }, LOCK_HEARTBEAT_MS);
+  hb.unref?.();
+  try {
+    return await runTickBody({ ...opts, source, t0, lock });
+  } finally {
+    clearInterval(hb);
+    await releaseTickLock(lock);
+  }
+}
+
+async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; source: string; t0: number; lock: string }) {
+  const t0 = opts.t0;
+  const settings = await getSettings();
+  if (!settings.bot_enabled) {
+    await touchTick(opts.source);
+    return { ok: true, skipped: true, reason: "bot off", public: publicSettings(await getSettings()) };
+  }
+
+  const venue = bookVenue(settings.venue);
+  const minMcap = minCapUsd(settings.min_market_cap_usd);
+
+  let universe: Array<{
+    symbol: string;
+    base: string;
+    name: string;
+    market_cap_usd: number;
+    volume_24h_usd: number;
+    max_leverage: number;
+  }>;
+  try {
+    const fresh = await refreshUniverse(minMcap, venue, Boolean(opts?.forceUniverse));
+    universe = fresh.map((a) => ({
+      symbol: a.symbol,
+      base: a.base,
+      name: a.name,
+      market_cap_usd: a.marketCapUsd,
+      volume_24h_usd: a.volume24hUsd,
+      max_leverage: a.maxLeverage,
+    }));
+  } catch {
+    const stored = await getSettings().catch(() => null);
+    const existing = await listUniverse().catch(() => []);
+    if (existing.length && bookVenue(stored?.universe_venue ?? "") === venue) {
+      universe = filterByMinCap(existing, minMcap, (a) => Number(a.market_cap_usd));
+    } else {
+      universe = [];
+    }
+  }
+
+  const open = await listOpenPositions();
+  let closed = 0;
+  let opened = 0;
+  let signals = 0;
+  let scanned = 0;
+
+  const openSyms = [...new Set(open.map((p) => p.symbol))];
+  const lastBars = new Map<string, Awaited<ReturnType<typeof fetchKlinesCached>>>();
+  await mapPool(openSyms, 4, async (sym) => {
+    try {
+      const bars = await fetchKlinesCached(sym, "5m", 96, venue);
+      lastBars.set(sym, bars);
+    } catch {
+      /* skip */
+    }
+  });
+
+  let equity = Number(settings.equity_usd);
+  const wantLive = settings.mode === "live" && venue !== "paper";
+  const live =
+    wantLive &&
+    Boolean(settings.live_enabled) &&
+    hasLiveKeys(settings, venue);
+  const liveBlock = wantLive && !live
+    ? !hasLiveKeys(settings, venue)
+      ? `${venue} keys incomplete — live blocked, not opening paper`
+      : `live not armed — not opening paper`
+    : "";
+  const acc = accountFrom(settings, venue === "paper" ? "lighter" : venue);
+  const adapter = live ? getAdapter(venue) : null;
+  let liveBalReady = !live;
+  let liveBookReady = !live;
+  if (live && adapter) {
+    try {
+      const bal = await adapter.fetchBalance(acc);
+      if (bal != null && Number.isFinite(bal)) {
+        equity = bal;
+        liveBalReady = true;
+        await setEquity(equity);
+      }
+    } catch {
+      liveBalReady = false;
+    }
+    if (!liveBalReady) {
+      equity = 0;
+    }
+    try {
+      const pending = await listOrphanFills();
+      for (const o of pending) {
+        try {
+          const res = await adapter.closePosition(acc, venueSymbol(venue, o.symbol));
+          if (res.ok || res.message === "flat") {
+            await dropOrphanFill(o.symbol);
+            continue;
+          }
+        } catch {
+          /* book a desk row so the open-loop retry can flatten */
+        }
+        try {
+          const id = await insertPosition({
+            mode: "live",
+            venue,
+            symbol: o.symbol,
+            timeframe: o.timeframe || "5m",
+            indicator: o.indicator || "ORPHAN",
+            side: o.side,
+            entry: o.entry,
+            sl: o.sl,
+            tp: o.tp,
+            qty: o.qty,
+            leverage: o.leverage,
+            notional: o.notional,
+            risk: o.risk,
+            fees: o.fees,
+            orderId: o.orderId,
+            barTime: o.barTime,
+            origSl: o.origSl ?? o.sl,
+            signalReason: `${o.reason ?? ""} · ${ORPHAN_MARK}`,
+            margin: o.notional / Math.max(1, o.leverage),
+          });
+          if (id) await dropOrphanFill(o.symbol);
+        } catch {
+          /* keep the JSON breadcrumb */
+        }
+      }
+    } catch {
+      /* orphan column may be missing until migrate */
+    }
+  }
+
+  for (const pos of open) {
+    if (pos.mode === "live") {
+      if (!live || !adapter) continue;
+      if (pos.venue && pos.venue !== "paper" && bookVenue(pos.venue) !== venue) continue;
+    }
+    if (live && adapter && pos.mode === "live" && isOrphanPosition(pos)) {
+      try {
+        const res = await adapter.closePosition(acc, venueSymbol(venue, pos.symbol));
+        if (res.ok || res.message === "flat") {
+          let exitPx = Number(pos.entry);
+          try {
+            const last = await fetchVenueLastPrice(venue, pos.symbol);
+            if (Number.isFinite(last)) exitPx = last;
+          } catch {
+            /* keep entry */
+          }
+          const resolved = await resolveLiveExit(adapter, acc, venue, pos, exitPx);
+          const holdMs = Math.max(0, Date.now() - new Date(pos.opened_at).getTime());
+          await closePosition(pos.id, resolved.exit, "flatten retry", resolved.pnl, resolved.pnlR, { holdMs, beMoved: false });
+          closed += 1;
+          continue;
+        }
+      } catch {
+        /* still walk SL/TP below; retry flatten next tick */
+      }
+    }
+    if (live && adapter && pos.mode === "live") {
+      const vs = venueSymbol(venue, pos.symbol);
+      const side = pos.side as "long" | "short";
+      const slNow = Number(pos.sl);
+      const tpNow = Number(pos.tp);
+      const qtyNow = Number(pos.qty);
+      let skipBe = false;
+      try {
+        const prot = await adapter.fetchProtection(acc, { symbol: vs, sl: slNow, tp: tpNow });
+        if (!prot.unknown && !prot.onVenue) {
+          skipBe = true;
+        } else if (!prot.unknown && prot.onVenue && (!prot.hasSl || !prot.hasTp)) {
+          let restored = false;
+          try {
+            const placed = await adapter.updateStop(acc, {
+              symbol: vs,
+              side,
+              sl: slNow,
+              tp: tpNow,
+              qty: qtyNow,
+            });
+            if (placed.ok) {
+              const again = await adapter.fetchProtection(acc, { symbol: vs, sl: slNow, tp: tpNow });
+              restored = !again.unknown && again.hasSl && again.hasTp;
+            }
+          } catch {
+            restored = false;
+          }
+          if (!restored) {
+            const res = await adapter.closePosition(acc, vs);
+            if (res.ok || res.message === "flat") {
+              let exitPx = Number(pos.entry);
+              try {
+                const last = await fetchVenueLastPrice(venue, pos.symbol);
+                if (Number.isFinite(last)) exitPx = last;
+              } catch {
+                /* keep entry */
+              }
+              const resolved = await resolveLiveExit(adapter, acc, venue, pos, exitPx);
+              const holdMs = Math.max(0, Date.now() - new Date(pos.opened_at).getTime());
+              await closePosition(pos.id, resolved.exit, "unprotected", resolved.pnl, resolved.pnlR, { holdMs, beMoved: false });
+              closed += 1;
+              continue;
+            }
+            skipBe = true;
+          }
+        }
+      } catch {
+        /* next tick retries protection */
+      }
+      if (!skipBe) {
+      const bars = lastBars.get(pos.symbol);
+      const last = bars?.[bars.length - 1];
+      const beAtR = trexBeAtR(pos.indicator);
+      if (last && beAtR) {
+        const entry = Number(pos.entry);
+        const origPx = origStopPx({
+          side,
+          entry,
+          sl: slNow,
+          origSl: pos.orig_sl,
+          qty: pos.qty,
+          risk: pos.risk_usd,
+        });
+        const dist = Math.abs(entry - origPx);
+        const alreadyBe = Math.abs(slNow - entry) <= 1e-8 * Math.max(1, entry);
+        const fav = side === "long" ? last.close - entry : entry - last.close;
+        if (!alreadyBe && dist > 0 && fav >= beAtR * dist) {
+          try {
+            const res = await adapter.updateStop(acc, {
+              symbol: vs,
+              side,
+              sl: entry,
+              tp: tpNow,
+              qty: qtyNow,
+            });
+            if (res.ok) await updatePositionSl(pos.id, entry);
+          } catch {
+            /* keep original stop on desk and venue */
+          }
+        }
+      }
+      }
+      continue;
+    }
+    const bars = lastBars.get(pos.symbol);
+    if (!bars?.length) continue;
+    const side = pos.side as "long" | "short";
+    const entry = Number(pos.entry);
+    let slNow = Number(pos.sl);
+    const tpNow = Number(pos.tp);
+    const tf = (pos.timeframe as Timeframe) in TF_MS ? (pos.timeframe as Timeframe) : "5m";
+    const tfMs = TF_MS[tf];
+    const openedMs = new Date(pos.opened_at).getTime();
+    const barTime = Number(pos.bar_time);
+    const start = Number.isFinite(barTime) && barTime > 0 ? barTime + tfMs : openedMs;
+    let path = bars.filter((b) => b.time >= start - 2000);
+    if (!path.length) path = [bars[bars.length - 1]!];
+    const walked = walkPath({
+      side,
+      entry,
+      sl: slNow,
+      tp: tpNow,
+      bars: path,
+      beAtR: trexBeAtR(pos.indicator),
+    });
+    if (walked.beMoved && Math.abs(walked.sl - slNow) > 1e-12) {
+      let venueOk = true;
+      if (live && adapter && pos.mode === "live") {
+        try {
+          const res = await adapter.updateStop(acc, {
+            symbol: venueSymbol(venue, pos.symbol),
+            side,
+            sl: walked.sl,
+            tp: tpNow,
+            qty: Number(pos.qty),
+          });
+          venueOk = res.ok;
+        } catch {
+          venueOk = false;
+        }
+      }
+      if (venueOk) {
+        try {
+          await updatePositionSl(pos.id, walked.sl);
+          slNow = walked.sl;
+        } catch {
+          /* keep original stop */
+        }
+      }
+    }
+    const reason = walked.hit?.reason ?? null;
+    if (reason) {
+      const why = reason;
+      if (live && adapter && pos.mode === "live") {
+        try {
+          const res = await adapter.closePosition(acc, venueSymbol(venue, pos.symbol));
+          if (!res.ok) continue;
+        } catch {
+          continue;
+        }
+      }
+      const origPx = origStopPx({
+        side,
+        entry,
+        sl: Number(pos.sl),
+        origSl: pos.orig_sl,
+        qty: pos.qty,
+        risk: pos.risk_usd,
+      });
+      const until = walked.hit ? path.filter((b) => b.time <= walked.hit!.barTime) : path;
+      const { maeR, mfeR } = pathExcursion({ side, entry, origSl: origPx, bars: until });
+      const openMs = Number.isFinite(barTime) && barTime > 0 ? barTime : openedMs;
+      const closeMs = walked.hit?.barTime ?? Date.now();
+      let exit = walked.hit!.exit;
+      let pnl = pnlAt(side, entry, exit, Number(pos.qty), Number(pos.fees_usd));
+      const slDist = Math.abs(entry - origPx);
+      let pnlR = slDist > 0 ? (side === "long" ? exit - entry : entry - exit) / slDist : 0;
+      if (live && adapter && pos.mode === "live") {
+        const resolved = await resolveLiveExit(adapter, acc, venue, pos, exit);
+        exit = resolved.exit;
+        pnl = resolved.pnl;
+        pnlR = resolved.pnlR;
+      }
+      await closePosition(pos.id, exit, why, pnl, pnlR, {
+        maeR,
+        mfeR,
+        barsHeld: walked.barsHeld,
+        holdMs: Math.max(0, closeMs - openMs),
+        beMoved: walked.beMoved,
+      });
+      if (live && pos.mode === "live") {
+        /* equity comes from the venue wallet, not the paper delta */
+      } else {
+        equity += pnl;
+        await bumpEquity(pnl);
+      }
+      closed += 1;
+    }
+  }
+
+  let venueBook: Array<{ symbol: string; side: "long" | "short"; qty: number }> | null = null;
+  if (live && adapter) {
+    try {
+      const exPos = await adapter.fetchPositions(acc);
+      venueBook = exPos;
+      liveBookReady = true;
+      const still = await listOpenPositions();
+      for (const pos of still) {
+        if (pos.mode !== "live") continue;
+        if (pos.venue && pos.venue !== "paper" && bookVenue(pos.venue) !== venue) continue;
+        const age = Date.now() - new Date(pos.opened_at).getTime();
+        if (age < 45_000) continue;
+        const onEx = exPos.some((p) => sameCoin(p.symbol, pos.symbol) || sameCoin(p.symbol, venueSymbol(venue, pos.symbol)));
+        if (onEx) continue;
+        let exitPx = Number(pos.entry);
+        try {
+          const last = await fetchVenueLastPrice(venue, pos.symbol);
+          if (Number.isFinite(last)) exitPx = last;
+        } catch {
+          /* keep entry */
+        }
+        const resolved = await resolveLiveExit(adapter, acc, venue, pos, exitPx);
+        const holdMs = Math.max(0, Date.now() - new Date(pos.opened_at).getTime());
+        await closePosition(pos.id, resolved.exit, "venue", resolved.pnl, resolved.pnlR, { holdMs, beMoved: false });
+        closed += 1;
+      }
+    } catch {
+      liveBookReady = false;
+      /* venue read failed — keep desk rows, do not treat as all-flat */
+    }
+    if (liveBalReady) {
+      try {
+        const bal = await adapter.fetchBalance(acc);
+        if (bal != null && Number.isFinite(bal)) {
+          equity = bal;
+          await setEquity(equity);
+        }
+      } catch {
+        /* keep last live equity */
+      }
+    }
+  }
+
+  const stillOpen = await listOpenPositions();
+  const held = new Set(stillOpen.map((p) => p.symbol));
+  let usedMargin = stillOpen.reduce(
+    (a, p) => a + Number(p.notional_usd) / Math.max(1, Number(p.leverage)),
+    0,
+  );
+
+  const scanDone = {
+    "5m": Number(settings.scan_done_5m) || 0,
+    "15m": Number(settings.scan_done_15m) || 0,
+    "1h": Number(settings.scan_done_1h) || 0,
+    "4h": Number(settings.scan_done_4h) || 0,
+  };
+  const nowMs = Date.now();
+  const tfs = dueTimeframes(nowMs, scanDone, opts.source);
+  const engineGates = parseEngineGates(settings.engine_gates);
+  const sideGates = parseSideGates(settings.engine_gates);
+  if (!tfs.length) {
+    await touchTick(opts.source);
+    return {
+      ok: true,
+      skipped: true,
+      reason: "waiting for next closed bar",
+      scanned: 0,
+      signals: 0,
+      opened: closed,
+      closed,
+      durationMs: Date.now() - t0,
+      coins: 0,
+      universe: universe.length,
+      tfs,
+      public: publicSettings(await getSettings()),
+    };
+  }
+
+  const tradeable = universe;
+  const batch = resolveBatch(opts?.batch ?? Number(settings.scan_batch), tradeable.length);
+  const closed5m = latestClosedOpen(TF_MS["5m"], nowMs);
+  const cursors = parseCursors(settings.scan_cursors);
+  if (!settings.scan_cursors) {
+    const legacy = Number(settings.scan_cursor) || 0;
+    const epoch = Number(settings.scan_epoch_ms) || 0;
+    cursors["5m"] = { c: legacy, e: epoch };
+  }
+  type TfWork = { tf: Timeframe; closedOpen: number; cur: number; slice: typeof tradeable; done: boolean[] };
+  const tfWork: TfWork[] = tfs.map((tf) => {
+    const closedOpen = latestClosedOpen(TF_MS[tf], nowMs);
+    const saved = cursors[tf] ?? { c: 0, e: 0 };
+    const cur = saved.e !== closedOpen && closedOpen > 0 ? 0 : saved.c;
+    const slice: typeof tradeable = [];
+    const n = Math.min(batch, tradeable.length);
+    for (let k = 0; k < n; k++) slice.push(tradeable[(cur + k) % Math.max(1, tradeable.length)]!);
+    return { tf, closedOpen, cur, slice, done: slice.map(() => false) };
+  });
+  const planned = new Map<string, Timeframe[]>();
+  const slice: typeof tradeable = [];
+  const tagged = tfWork.map((w) => w.slice.map((a) => ({ a, tf: w.tf })));
+  for (const row of interleaveSlices(tagged)) {
+    const list = planned.get(row.a.symbol);
+    if (list) {
+      if (!list.includes(row.tf)) list.push(row.tf);
+    } else {
+      planned.set(row.a.symbol, [row.tf]);
+      slice.push(row.a);
+    }
+  }
+
+  type Found = {
+    symbol: string;
+    timeframe: Timeframe;
+    indicator: string;
+    side: "long" | "short";
+    entry: number;
+    sl: number;
+    tp: number;
+    rr: number;
+    atr: number;
+    reason: string;
+    barTime: number;
+  };
+  const found: Found[] = [];
+  const seenSig = new Set<string>();
+  const deadline = t0 + tickBudgetMs();
+  let scannedCoins = 0;
+  let tried = 0;
+  const lastN = live ? 1 : scanLastN(opts.source);
+  const finished = new Set<string>();
+
+  if (Date.now() + 1_500 < deadline) {
+  await mapPool(slice, SCAN_CONCURRENCY, async (asset) => {
+    if (Date.now() > deadline) return;
+    tried += 1;
+    try {
+    const tfsHere = planned.get(asset.symbol) ?? tfs;
+    const need = new Set<KlineTf>(tfsHere);
+    for (const tf of tfsHere) {
+      need.add(HTF_OF[tf]);
+      need.add(HTF2_OF[tf]);
+    }
+    const loaded = new Map<KlineTf, Awaited<ReturnType<typeof fetchKlinesCached>>>();
+    await Promise.all(
+      [...need].map(async (tf) => {
+        const limit = tf === "1d" || tf === "1w" ? 80 : SCAN_BARS;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const bars = await fetchKlinesCached(asset.symbol, tf, limit, venue);
+            if (bars.length) {
+              loaded.set(tf, bars);
+              return;
+            }
+          } catch {
+            /* retry once — empty is not cached */
+          }
+        }
+        loaded.set(tf, []);
+      }),
+    );
+    let any = false;
+    const scannedTf = new Set<Timeframe>();
+    for (const tf of tfsHere) {
+      const raw = loaded.get(tf) ?? [];
+      const closedBars = onlyClosedBars(raw, tf);
+      if (closedBars.length < MIN_BARS) {
+        if (raw.length) scannedTf.add(tf);
+        continue;
+      }
+      scannedTf.add(tf);
+      const htfTf = HTF_OF[tf];
+      const htf2Tf = HTF2_OF[tf];
+      const htfClosed = onlyClosedBars(loaded.get(htfTf) ?? [], htfTf);
+      const htf2Closed = onlyClosedBars(loaded.get(htf2Tf) ?? [], htf2Tf);
+      scanned += 1;
+      any = true;
+      const names = scanNames(tf, engineGates);
+      const sigs = scanBarClosed(
+        closedBars,
+        tf,
+        htfClosed.length > 20 ? htfClosed : undefined,
+        lastN,
+        htf2Closed.length > 10 ? htf2Closed : undefined,
+        names,
+      );
+      for (const s of sigs) {
+        const key = `${asset.symbol}|${tf}|${s.indicator}|${s.barTime}`;
+        if (seenSig.has(key)) continue;
+        seenSig.add(key);
+        found.push({
+          symbol: asset.symbol,
+          timeframe: tf,
+          indicator: s.indicator,
+          side: s.side,
+          entry: s.entry,
+          sl: s.sl,
+          tp: s.tp,
+          rr: s.rr,
+          atr: s.atr,
+          reason: s.reason,
+          barTime: s.barTime,
+        });
+      }
+    }
+    if (any) scannedCoins += 1;
+    finished.add(asset.symbol);
+    for (const work of tfWork) {
+      const idx = work.slice.findIndex((a) => a.symbol === asset.symbol);
+      if (idx >= 0 && scannedTf.has(work.tf)) work.done[idx] = true;
+    }
+    } catch {
+      /* timeout/kline throw: leave done=false so the next ping retries this coin */
+    }
+  });
+  }
+  const scanIncomplete = Boolean(slice.length) && finished.size < slice.length;
+  if (tradeable.length && slice.length) {
+    const nextCursors: Record<string, TfCursor> = { ...cursors };
+    const done: { "5m"?: number; "15m"?: number; "1h"?: number; "4h"?: number } = {};
+    let next = Number(settings.scan_cursor) || 0;
+    for (const work of tfWork) {
+      const prefix = prefixCompleted(work.done);
+      const stepped = nextTfCursor({
+        cur: work.cur,
+        epoch: work.closedOpen,
+        closedOpen: work.closedOpen,
+        universeLen: tradeable.length,
+        prefixDone: prefix,
+      });
+      nextCursors[work.tf] = stepped.cursor;
+      if (work.tf === "5m") next = stepped.cursor.c;
+      if (stepped.wrapped) done[work.tf] = work.closedOpen;
+    }
+    try {
+      await markScanProgress({
+        cursor: next,
+        epochMs: closed5m,
+        cursors: nextCursors,
+        done: Object.keys(done).length ? done : undefined,
+      });
+    } catch {
+      await setScanCursor(next);
+    }
+  }
+
+  signals = found.length;
+  const remainingSlots = Math.max(0, Number(settings.max_positions) - (await listOpenPositions()).length);
+  let used = 0;
+  const capitalPctDefault = Number(settings.capital_pct) || DEFAULT_CAPITAL_PCT;
+  const levSizeTiers = parseLevSizeTiers(settings.lev_size_tiers);
+  const userLevCap = Math.min(200, Math.max(1, Math.round(Number(settings.max_leverage) || 200)));
+  const rawStackCount = Number(settings.stack_lev_count);
+  const stackCount = Number.isFinite(rawStackCount) ? Math.max(0, Math.round(rawStackCount)) : 2;
+  const stackCap = Math.min(200, Math.max(1, Math.round(Number(settings.stack_lev_cap) || 75)));
+  const levMemo = new Map<string, number>();
+  const openLevs = stillOpen.map((p) => Number(p.leverage) || 0);
+
+  async function coinMaxLev(sym: string) {
+    let n = levMemo.get(sym);
+    if (!n) {
+      n = capLeverage(await resolveMaxLeverage(venue, venue === "paper" ? sym : venueSymbol(venue, sym), acc));
+      levMemo.set(sym, n);
+    }
+    return n;
+  }
+
+  for (const s of found) {
+    let taken = false;
+    let skip = "";
+    const stale = (live || opts.source !== "manual") && !isFreshSignal(s.barTime, s.timeframe, Date.now());
+    if (stale) skip = "stale bar";
+    else if (!isSideOn(sideGates, s.indicator, s.side)) skip = "side muted";
+    else if (held.has(s.symbol)) skip = "already in symbol";
+    else if (
+      live &&
+      venueBook &&
+      venueBook.some((p) => sameCoin(p.symbol, s.symbol) || sameCoin(p.symbol, venueSymbol(venue, s.symbol)))
+    )
+      skip = "already on venue";
+    else if (live && (!liveBalReady || !liveBookReady))
+      skip = !liveBalReady
+        ? "live balance unread — not sending"
+        : "live positions unread — not sending";
+    else if (used >= remainingSlots) skip = "max positions";
+    else if (
+      await alreadyFilled({
+        symbol: s.symbol,
+        timeframe: s.timeframe,
+        indicator: s.indicator,
+        side: s.side,
+        entry: s.entry,
+        barTime: s.barTime,
+      })
+    )
+      skip = "already filled";
+    else {
+      const coinMax = await coinMaxLev(s.symbol);
+      const lev = Math.min(stackedUserLevCap(userLevCap, openLevs, stackCount, stackCap), coinMax);
+      // Bucket on the coin's venue max, not the used (user/stack-capped) leverage.
+      const capitalPct = capitalPctForLeverage(coinMax, capitalPctDefault, levSizeTiers);
+      const sized = sizePosition({
+        equity,
+        capitalPct,
+        entry: s.entry,
+        sl: s.sl,
+        leverage: lev,
+        usedMargin,
+      });
+      if (!sized) skip = "size failed";
+      else {
+        let orderId: string | undefined;
+        let placedLive = false;
+        let orphan = false;
+        let liveFillPx = 0;
+        let liveFillQty = 0;
+        let liveFillSl = s.sl;
+        let liveFillTp = s.tp;
+        let liveFillFees = sized.fees;
+        let liveStopsPlaced = false;
+        if (liveBlock) skip = liveBlock;
+        else if (live) {
+          const ad = getAdapter(venue);
+          if (!ad) skip = "no adapter";
+          else if (!hasLiveKeys(settings, venue)) skip = `${venue} keys missing`;
+          else if (!(await heartbeatTickLock(opts.lock))) skip = "tick lock lost";
+          else {
+            try {
+              const res = await ad.placeOrder(acc, {
+                symbol: venueSymbol(venue, s.symbol),
+                side: s.side,
+                qty: sized.qty,
+                leverage: lev,
+                sl: s.sl,
+                tp: s.tp,
+                entry: s.entry,
+              });
+              if (res.fillPrice && res.fillPrice > 0) liveFillPx = res.fillPrice;
+              if (res.filledQty && res.filledQty > 0) liveFillQty = res.filledQty;
+              if (res.sl && res.sl > 0) {
+                liveFillSl = res.sl;
+                liveStopsPlaced = true;
+              }
+              if (res.tp && res.tp > 0) {
+                liveFillTp = res.tp;
+                liveStopsPlaced = true;
+              }
+              if (res.feeUsd != null && Number.isFinite(res.feeUsd)) liveFillFees = res.feeUsd;
+              let final = res;
+              if (res.ok || res.liveOpen || res.orderId) {
+                if (res.ok || (!res.liveOpen && res.orderId)) {
+                  final = await confirmLiveFill(
+                    ad,
+                    acc,
+                    venueSymbol(venue, s.symbol),
+                    liveFillSl,
+                    liveFillTp,
+                    res.orderId,
+                  );
+                }
+              }
+              if (final.ok) {
+                orderId = final.orderId ?? res.orderId;
+                placedLive = true;
+              } else if (final.liveOpen) {
+                orderId = final.orderId ?? res.orderId;
+                placedLive = true;
+                orphan = true;
+              } else {
+                skip = final.message;
+              }
+            } catch (e) {
+              skip = e instanceof Error ? e.message : "order threw";
+              try {
+                const vs = venueSymbol(venue, s.symbol);
+                const prot = await ad.fetchProtection(acc, { symbol: vs, sl: liveFillSl, tp: liveFillTp });
+                if (!prot.unknown && prot.onVenue) {
+                  const check = await confirmLiveFill(ad, acc, vs, liveFillSl, liveFillTp);
+                  if (check.ok) {
+                    orderId = check.orderId;
+                    placedLive = true;
+                    skip = "";
+                  } else if (check.liveOpen) {
+                    orderId = check.orderId;
+                    placedLive = true;
+                    orphan = true;
+                    skip = "";
+                  } else {
+                    skip = check.message;
+                  }
+                }
+              } catch {
+                /* keep skip; nothing confirmed on venue */
+              }
+            }
+          }
+        }
+        if (placedLive && adapter) {
+          try {
+            const book = await adapter.fetchPositions(acc);
+            const hit = book.find(
+              (p) => sameCoin(p.symbol, s.symbol) || sameCoin(p.symbol, venueSymbol(venue, s.symbol)),
+            );
+            if (hit) {
+              if (hit.entry > 0) liveFillPx = hit.entry;
+              if (hit.qty > 0) liveFillQty = hit.qty;
+            }
+          } catch {
+            /* keep order result */
+          }
+          if (liveFillPx > 0) {
+            const rebased = rebaseStopsFromFill({
+              paperEntry: s.entry,
+              fill: liveFillPx,
+              sl: s.sl,
+              tp: s.tp,
+            });
+            const px = Math.max(1e-8, liveFillPx);
+            const slDrift = Math.abs(rebased.sl - liveFillSl) / px;
+            const tpDrift = Math.abs(rebased.tp - liveFillTp) / px;
+            liveFillSl = rebased.sl;
+            liveFillTp = rebased.tp;
+            if (!liveStopsPlaced || slDrift > 1e-4 || tpDrift > 1e-4) {
+              try {
+                await adapter.updateStop(acc, {
+                  symbol: venueSymbol(venue, s.symbol),
+                  side: s.side,
+                  sl: liveFillSl,
+                  tp: liveFillTp,
+                  qty: liveFillQty || sized.qty,
+                });
+                liveStopsPlaced = true;
+              } catch {
+                /* SL/TP already on book at fill prices (Aster rebases inside placeOrder) */
+              }
+            }
+          }
+        }
+        if (!skip) {
+          const fillEntry = liveFillPx > 0 ? liveFillPx : s.entry;
+          const fillQty = liveFillQty > 0 ? liveFillQty : sized.qty;
+          const fillSl = liveFillSl;
+          const fillTp = liveFillTp;
+          const fillNotional = fillQty * fillEntry;
+          const fillMargin = fillNotional / Math.max(1, lev);
+          const fillRisk = fillQty * Math.abs(fillEntry - fillSl);
+          const fillFees = liveFillPx > 0 ? (liveFillFees || (fillNotional * FEE_BPS) / 10000) : sized.fees;
+          const fill = {
+            mode: live ? "live" : "paper",
+            venue: live ? venue : "paper",
+            symbol: s.symbol,
+            timeframe: s.timeframe,
+            indicator: s.indicator,
+            side: s.side,
+            entry: fillEntry,
+            sl: fillSl,
+            tp: fillTp,
+            qty: fillQty,
+            leverage: lev,
+            notional: fillNotional || sized.notional,
+            risk: fillRisk || sized.risk,
+            fees: fillFees,
+            orderId,
+            barTime: s.barTime,
+            origSl: fillSl,
+            atr: s.atr,
+            equityAtOpen: equity,
+            rrPlanned: s.rr,
+            margin: fillMargin,
+          };
+          const reason = orphan ? `${s.reason} · ${ORPHAN_MARK}` : s.reason;
+          async function flattenLive() {
+            if (!adapter) return false;
+            try {
+              const res = await adapter.closePosition(acc, venueSymbol(venue, s.symbol));
+              return res.ok || res.message === "flat";
+            } catch {
+              return false;
+            }
+          }
+          async function bookOrphan() {
+            return insertPosition({ ...fill, signalReason: `${s.reason} · ${ORPHAN_MARK}` });
+          }
+          async function stashOrphan() {
+            try {
+              await rememberOrphanFill({
+                venue: fill.venue,
+                symbol: fill.symbol,
+                side: fill.side,
+                qty: fill.qty,
+                entry: fill.entry,
+                sl: fill.sl,
+                tp: fill.tp,
+                leverage: fill.leverage,
+                notional: fill.notional,
+                risk: fill.risk,
+                fees: fill.fees,
+                timeframe: fill.timeframe,
+                indicator: fill.indicator,
+                barTime: fill.barTime,
+                orderId: fill.orderId,
+                origSl: fill.origSl,
+                reason: s.reason,
+              });
+              return true;
+            } catch {
+              try {
+                await logScan(0, 0, 0, 0, 0, `${ORPHAN_MARK} ${fill.symbol}`, opts.source, { touch: false });
+              } catch {
+                /* venue fetchPositions still retries next tick */
+              }
+              return false;
+            }
+          }
+          try {
+            const id = await insertPosition({ ...fill, signalReason: reason });
+            if (!id) {
+              skip = "already filled";
+              if (placedLive) {
+                const flat = await flattenLive();
+                if (!flat) {
+                  const retry = await bookOrphan().catch(() => 0);
+                  if (retry) {
+                    held.add(s.symbol);
+                    openLevs.push(lev);
+                    used += 1;
+                    opened += 1;
+                    usedMargin += fillMargin;
+                    taken = true;
+                    skip = ORPHAN_MARK;
+                  } else {
+                    await stashOrphan();
+                    skip = ORPHAN_MARK;
+                  }
+                }
+              }
+            } else {
+              held.add(s.symbol);
+              openLevs.push(lev);
+              used += 1;
+              opened += 1;
+              usedMargin += sized.margin;
+              taken = true;
+              if (orphan) skip = ORPHAN_MARK;
+            }
+          } catch (e) {
+            skip = e instanceof Error ? e.message : "position insert failed";
+            if (placedLive) {
+              const flat = await flattenLive();
+              if (!flat) {
+                try {
+                  const retry = await bookOrphan();
+                  if (retry) {
+                    held.add(s.symbol);
+                    openLevs.push(lev);
+                    used += 1;
+                    opened += 1;
+                    usedMargin += fillMargin;
+                    taken = true;
+                    skip = ORPHAN_MARK;
+                  } else {
+                    await stashOrphan();
+                    skip = ORPHAN_MARK;
+                  }
+                } catch {
+                  await stashOrphan();
+                  skip = ORPHAN_MARK;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    try {
+      await insertSignal({
+        barTime: s.barTime,
+        symbol: s.symbol,
+        timeframe: s.timeframe,
+        indicator: s.indicator,
+        side: s.side,
+        entry: s.entry,
+        sl: s.sl,
+        tp: s.tp,
+        rr: s.rr,
+        atr: s.atr,
+        reason: s.reason,
+        taken,
+        skipReason: skip || undefined,
+      });
+    } catch {
+      /* schema mismatch must not abort the rest of the tick */
+    }
+  }
+
+  const freshSettings = await getSettings();
+  if (live && adapter && liveBalReady) {
+    try {
+      const bal = await adapter.fetchBalance(acc);
+      if (bal != null && Number.isFinite(bal)) {
+        await setEquity(bal);
+        freshSettings.equity_usd = bal;
+      }
+    } catch {
+      /* snapshot whatever is stored */
+    }
+  }
+  await snapshotEquity(Number(freshSettings.equity_usd), (await listOpenPositions()).length, freshSettings.mode);
+  const ms = Date.now() - t0;
+  const heads = slice.slice(0, 8).map((s) => s.base).join(",");
+  const note = `${scannedCoins}/${tradeable.length} ${venue} perps · chart ${chartHostLabel(venue)} · ${tfs.join("/")}${scanIncomplete ? " · sweep continues next minute" : " · fresh close"} · ${heads}${slice.length > 8 ? "…" : ""}${liveBlock ? ` · ${liveBlock}` : ""}`;
+  await logScan(scanned, signals, opened, closed, ms, note, opts.source);
+
+  return {
+    ok: true,
+    skipped: false,
+    scanned,
+    signals,
+    opened,
+    closed,
+    durationMs: ms,
+    coins: scannedCoins,
+    universe: universe.length,
+    tfs,
+    batch: slice.map((s) => s.symbol),
+    public: publicSettings(await getSettings()),
+  };
+}
+
+export async function markToMarket(symbol: string, venue: VenueId = "paper") {
+  return fetchVenueLastPrice(venue, symbol);
+}
