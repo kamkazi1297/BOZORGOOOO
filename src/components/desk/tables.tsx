@@ -61,7 +61,7 @@ export function PositionsTable({
             <th className="px-3 py-2 font-medium">TP</th>
             <th className="px-3 py-2 font-medium">Lev</th>
             <th className="px-3 py-2 font-medium">R</th>
-            <th className="px-3 py-2 font-medium">{locale === "fa" ? "سود $" : "PnL $"}</th>
+            <th className="px-3 py-2 font-medium">{locale === "fa" ? "سود خالص" : "Net $"}</th>
             <th className="px-3 py-2 font-medium">{locale === "fa" ? "خروج" : "Out"}</th>
             <th className="px-3 py-2 font-medium">When</th>
           </tr>

@@ -4,7 +4,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { defaultMaxLeverage } from "@/lib/market/binance";
 import { coinOf, isTradeableBase, nativeSymbol } from "./meta";
 import { capLeverage } from "./lev-cap";
-import type { ExchangeAdapter, ExchangeAccount, ListedMarket, PlaceOrderInput, PlaceOrderResult, ProtectionSnapshot, UpdateStopInput } from "./types";
+import type { ExchangeAdapter, ExchangeAccount, ListedMarket, PlaceOrderInput, PlaceOrderResult, ProtectionSnapshot, UpdateStopInput, WalletSnapshot } from "./types";
 
 const INFO_URL = "https://api.hyperliquid.xyz/info";
 
@@ -355,15 +355,23 @@ export const hyperliquidAdapter: ExchangeAdapter = {
       return defaultMaxLeverage(symbol);
     }
   },
-  async fetchBalance(account) {
+  async fetchWallet(account): Promise<WalletSnapshot | null> {
     const user = masterAddress(account);
     if (!user) return null;
     const state = await info<{ withdrawable?: string; marginSummary?: { accountValue?: string } }>({
       type: "clearinghouseState",
       user,
     });
-    const v = Number(state.withdrawable ?? state.marginSummary?.accountValue ?? 0);
-    return Number.isFinite(v) ? v : null;
+    const equity = Number(state.marginSummary?.accountValue ?? state.withdrawable ?? 0);
+    const available = Number(state.withdrawable ?? state.marginSummary?.accountValue ?? 0);
+    if (!Number.isFinite(available) && !Number.isFinite(equity)) return null;
+    const a = Number.isFinite(available) ? Math.max(0, available) : 0;
+    const e = Number.isFinite(equity) ? Math.max(0, equity) : a;
+    return { equity: e, available: a };
+  },
+  async fetchBalance(account) {
+    const w = this.fetchWallet ? await this.fetchWallet(account) : null;
+    return w?.available ?? null;
   },
   async placeOrder(account, order: PlaceOrderInput): Promise<PlaceOrderResult> {
     try {

@@ -21,6 +21,7 @@ import type {
   ProtectionSnapshot,
   UpdateStopInput,
   VenueTrade,
+  WalletSnapshot,
 } from "./types";
 
 const BASE = "https://futures.ourbit.com";
@@ -541,7 +542,7 @@ export const ourbitAdapter: ExchangeAdapter = {
     }
     return 25;
   },
-  async fetchBalance(account) {
+  async fetchWallet(account): Promise<WalletSnapshot | null> {
     const raw = await signed(account, "GET", "/api/v1/private/account/assets");
     const rows = asRows(raw) as Array<{
       currency?: string;
@@ -550,7 +551,17 @@ export const ourbitAdapter: ExchangeAdapter = {
       cashBalance?: number | string;
     }>;
     const usdt = rows.find((r) => String(r.currency ?? "").toUpperCase() === "USDT") ?? rows[0];
-    return Number(usdt?.equity ?? usdt?.availableBalance ?? usdt?.cashBalance ?? 0);
+    if (!usdt) return null;
+    const equity = Number(usdt.equity ?? usdt.cashBalance ?? usdt.availableBalance ?? 0);
+    const available = Number(usdt.availableBalance ?? usdt.equity ?? usdt.cashBalance ?? 0);
+    if (!Number.isFinite(available) && !Number.isFinite(equity)) return null;
+    const a = Number.isFinite(available) ? Math.max(0, available) : 0;
+    const e = Number.isFinite(equity) ? Math.max(0, equity) : a;
+    return { equity: e, available: a };
+  },
+  async fetchBalance(account) {
+    const w = this.fetchWallet ? await this.fetchWallet(account) : null;
+    return w?.available ?? null;
   },
   async placeOrder(account, order: PlaceOrderInput): Promise<PlaceOrderResult> {
     if (!account.apiKey || !account.apiSecret) return { ok: false, message: "OURBIT API key and secret required" };

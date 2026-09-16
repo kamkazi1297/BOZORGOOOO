@@ -105,6 +105,7 @@ export function publicSettings(row: SettingsRow, opts?: { unlocked?: boolean }) 
     maxPositions: num(row.max_positions, 4),
     minMarketCapUsd: num(row.min_market_cap_usd, 0),
     equityUsd: num(row.equity_usd, 10000),
+    availableUsd: num(row.equity_usd, 10000),
     startingEquityUsd: num(row.starting_equity_usd, 10000),
     liveEnabled: Boolean(num(row.live_enabled)),
     botEnabled: Boolean(num(row.bot_enabled, 1)),
@@ -786,6 +787,7 @@ export async function closePosition(
     barsHeld?: number | null;
     holdMs?: number | null;
     beMoved?: boolean;
+    feesUsd?: number | null;
   },
 ) {
   const sql = await getSql();
@@ -794,6 +796,13 @@ export async function closePosition(
     set status = 'closed', closed_at = now(), exit_px = ${exit}, exit_reason = ${reason}, pnl_usd = ${pnl}, pnl_r = ${pnlR}
     where id = ${id} and status = 'open'
   `;
+  if (extra?.feesUsd != null && Number.isFinite(extra.feesUsd)) {
+    try {
+      await sql`update positions set fees_usd = ${extra.feesUsd} where id = ${id}`;
+    } catch {
+      /* fees column always exists; ignore if the row already closed */
+    }
+  }
   if (!extra) return;
   try {
     await sql`

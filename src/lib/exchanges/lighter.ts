@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { defaultMaxLeverage } from "@/lib/market/binance";
 import { coinOf, isTradeableBase, nativeSymbol } from "./meta";
 import { capLeverage } from "./lev-cap";
-import type { ExchangeAdapter, ExchangeAccount, ListedMarket, PlaceOrderInput, PlaceOrderResult, ProtectionSnapshot, UpdateStopInput } from "./types";
+import type { ExchangeAdapter, ExchangeAccount, ListedMarket, PlaceOrderInput, PlaceOrderResult, ProtectionSnapshot, UpdateStopInput, WalletSnapshot } from "./types";
 
 const BASE = "https://mainnet.zklighter.elliot.ai";
 
@@ -294,17 +294,25 @@ export const lighterAdapter: ExchangeAdapter = {
     const row = marketOf(markets, symbol);
     return capLeverage(row?.maxLeverage || defaultMaxLeverage(symbol));
   },
-  async fetchBalance(account) {
+  async fetchWallet(account): Promise<WalletSnapshot | null> {
     if (!account.apiKey && account.accountIndex == null) return null;
     try {
       const json = await accountQuery(account);
       if (!json) return null;
       const acc = json.accounts?.[0] ?? json;
-      const v = Number(acc.available_balance ?? acc.collateral ?? 0);
-      return Number.isFinite(v) ? v : null;
+      const available = Number(acc.available_balance ?? acc.collateral ?? 0);
+      const equity = Number(acc.collateral ?? acc.available_balance ?? 0);
+      if (!Number.isFinite(available) && !Number.isFinite(equity)) return null;
+      const a = Number.isFinite(available) ? Math.max(0, available) : 0;
+      const e = Number.isFinite(equity) ? Math.max(0, equity) : a;
+      return { equity: e, available: a };
     } catch {
       return null;
     }
+  },
+  async fetchBalance(account) {
+    const w = this.fetchWallet ? await this.fetchWallet(account) : null;
+    return w?.available ?? null;
   },
   async placeOrder(account, order: PlaceOrderInput): Promise<PlaceOrderResult> {
     try {

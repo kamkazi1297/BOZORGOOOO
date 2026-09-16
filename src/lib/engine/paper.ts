@@ -26,7 +26,7 @@ export type PaperExit = PaperFill & {
   closedBarTime: number;
 };
 
-/** Margin = capitalPct of equity. Notional = margin × max leverage of that coin. */
+/** Margin = capitalPct of FREE capital. Locked margin is ignored. Notional = margin × leverage. */
 export function sizePosition(opts: {
   equity: number;
   capitalPct: number;
@@ -34,14 +34,18 @@ export function sizePosition(opts: {
   sl: number;
   leverage: number;
   usedMargin?: number;
+  /** If set, this is the free pile to size from (live wallet). Otherwise free = equity − usedMargin. */
+  available?: number;
 }) {
   const lev = Math.max(1, opts.leverage);
   const pct = Math.min(100, Math.max(1, opts.capitalPct));
-  const want = opts.equity * (pct / 100);
-  const used = Math.max(0, opts.usedMargin ?? 0);
-  const free = Math.max(0, opts.equity - used);
-  if (want <= 0 || opts.entry <= 0 || free < want * 0.9) return null;
-  const margin = Math.min(want, free * 0.98);
+  const free =
+    opts.available != null && Number.isFinite(opts.available)
+      ? Math.max(0, opts.available)
+      : Math.max(0, opts.equity - Math.max(0, opts.usedMargin ?? 0));
+  const want = free * (pct / 100);
+  if (!(want > 0) || !(opts.entry > 0) || !(free > 0)) return null;
+  const margin = Math.min(want, free * 0.995);
   if (!(margin > 0)) return null;
   const notional = margin * lev;
   const qty = notional / opts.entry;
@@ -165,8 +169,45 @@ export function pathExcursion(opts: {
 
 export function pnlAt(side: Side, entry: number, exit: number, qty: number, openFee: number) {
   const gross = side === "long" ? (exit - entry) * qty : (entry - exit) * qty;
-  const closeFee = (Math.abs(exit * qty) * FEE_BPS) / 10000;
-  return gross - openFee - closeFee;
+  const closeFee = estimatedCloseFee(exit, qty);
+  return gross - Math.abs(openFee) - closeFee;
+}
+
+export function estimatedCloseFee(exit: number, qty: number) {
+  return (Math.abs(exit * qty) * FEE_BPS) / 10000;
+}
+
+/** Open fee (given or estimated) + close fee. Round-trip commission for the journal. */
+export function roundTripFees(opts: { qty: number; entry: number; exit: number; openFee?: number }) {
+  const open =
+    opts.openFee != null && Number.isFinite(opts.openFee)
+      ? Math.abs(opts.openFee)
+      : (Math.abs(opts.entry * opts.qty) * FEE_BPS) / 10000;
+  return open + estimatedCloseFee(opts.exit, opts.qty);
+}
+
+/** Net R after fees: dollars made / dollars risked. Falls back to price R if risk is missing. */
+export function netPnlR(pnlUsd: number, riskUsd: number, fallback = 0) {
+  if (Number.isFinite(pnlUsd) && Number.isFinite(riskUsd) && riskUsd > 0) return pnlUsd / riskUsd;
+  return fallback;
+}
+
+/** Gross price move minus round-trip commission. This is what the journal stores. */
+export function netClosePnl(opts: {
+  side: Side;
+  entry: number;
+  exit: number;
+  qty: number;
+  riskUsd: number;
+  openFee?: number;
+}) {
+  const openFee =
+    opts.openFee != null && Number.isFinite(opts.openFee)
+      ? Math.abs(opts.openFee)
+      : (Math.abs(opts.entry * opts.qty) * FEE_BPS) / 10000;
+  const fees = openFee + estimatedCloseFee(opts.exit, opts.qty);
+  const pnl = pnlAt(opts.side, opts.entry, opts.exit, opts.qty, openFee);
+  return { pnl, fees, pnlR: netPnlR(pnl, opts.riskUsd) };
 }
 
 /** Shift SL/TP by the live fill vs the paper/signal entry. Distances stay the same. */
@@ -230,7 +271,8 @@ export function closeFromVenueTrades(opts: {
   if (!(qty > 0)) return null;
   const exit = notional / qty;
   if (!sawPnl) {
-    pnl = pnlAt(opts.side, opts.entry, exit, qty, 0) - fees;
+    const gross = opts.side === "long" ? (exit - opts.entry) * qty : (opts.entry - exit) * qty;
+    pnl = gross - fees;
   } else {
     pnl -= fees;
   }

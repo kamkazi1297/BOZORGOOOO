@@ -3,7 +3,7 @@ import { FALLBACK_UNIVERSE, fetchUniverse, fetchVenueUniverse, filterByMinCap, m
 import { fetchVenueLastPrice } from "@/lib/market/venues";
 import { onlyClosedBars, scanBarClosed } from "@/lib/engine/run";
 import { parseEngineGates, parseSideGates, scanNames, isSideOn } from "@/lib/engine/engine-gates";
-import { origStopPx, pathExcursion, pnlAt, rebaseStopsFromFill, closeFromVenueTrades, sizePosition, walkPath } from "@/lib/engine/paper";
+import { origStopPx, pathExcursion, rebaseStopsFromFill, closeFromVenueTrades, sizePosition, walkPath, netClosePnl, netPnlR } from "@/lib/engine/paper";
 import { capitalPctForLeverage, DEFAULT_CAPITAL_PCT, parseLevSizeTiers } from "@/lib/engine/lev-size";
 import { FEE_BPS, HTF2_OF, HTF_OF, TF_MS, WARMUP, type KlineTf, type Timeframe, type VenueId } from "@/lib/engine/types";
 import {
@@ -20,7 +20,8 @@ import {
 import { bookVenue, chartHostLabel, getAdapter, resolveMaxLeverage, sameCoin, venueSymbol } from "@/lib/exchanges/registry";
 import { venueMaxLeverage, loadPublicLeverageMaps } from "@/lib/exchanges/leverage";
 import { capLeverage, stackedUserLevCap } from "@/lib/exchanges/lev-cap";
-import type { ExchangeAccount, ExchangeAdapter, PlaceOrderResult, ProtectionSnapshot } from "@/lib/exchanges/types";
+import type { ExchangeAccount, ExchangeAdapter, PlaceOrderResult, ProtectionSnapshot, WalletSnapshot } from "@/lib/exchanges/types";
+import { readVenueWallet, usedMarginUsd, attachAvailable } from "@/lib/exchanges/wallet";
 import {
   alreadyFilled,
   acquireTickLock,
@@ -143,28 +144,29 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 }
 
 /** Overlay live venue balance / fill onto the desk payload. Style unchanged. */
-export async function overlayLiveSnapshot<T extends { mode: string; venue: string; liveEnabled: boolean; equityUsd: number }>(
-  settings: T,
-  open: PositionRow[],
-): Promise<{ settings: T; open: PositionRow[] }> {
+export async function overlayLiveSnapshot<
+  T extends { mode: string; venue: string; liveEnabled: boolean; equityUsd: number; availableUsd?: number },
+>(settings: T, open: PositionRow[]): Promise<{ settings: T; open: PositionRow[] }> {
   const venue = bookVenue(settings.venue);
   if (settings.mode !== "live" || venue === "paper") {
-    return { settings, open };
+    return { settings: attachAvailable(settings, open), open };
   }
   const row = await getSettings().catch(() => null);
-  if (!row || !hasLiveKeys(row, venue)) return { settings, open };
+  if (!row || !hasLiveKeys(row, venue)) return { settings: attachAvailable(settings, open), open };
   const adapter = getAdapter(venue);
-  if (!adapter) return { settings, open };
+  if (!adapter) return { settings: attachAvailable(settings, open), open };
   const acc = accountFrom(row, venue);
   let next = settings;
   try {
-    const bal = await withTimeout(adapter.fetchBalance(acc), 5000);
-    if (bal != null && Number.isFinite(bal)) {
-      next = { ...next, equityUsd: bal };
-      await setEquity(bal).catch(() => undefined);
+    const w = await withTimeout(readVenueWallet(adapter, acc), 5000);
+    if (w) {
+      next = { ...next, equityUsd: w.equity, availableUsd: w.available };
+      await setEquity(w.equity).catch(() => undefined);
+    } else {
+      next = attachAvailable(next, open);
     }
   } catch {
-    /* keep stored equity */
+    next = attachAvailable(next, open);
   }
   if (!open.length) return { settings: next, open };
   try {
@@ -216,6 +218,7 @@ async function resolveLiveExit(
   const slDist = Math.abs(entry - origPx);
   let exit = fallbackPx;
   let pnl: number | null = null;
+  let fees: number | null = null;
   if (adapter.fetchTrades) {
     try {
       const openedAt = new Date(pos.opened_at).getTime();
@@ -227,16 +230,39 @@ async function resolveLiveExit(
       if (hit) {
         exit = hit.exit;
         pnl = hit.pnl;
+        fees = hit.fees;
       }
     } catch {
       /* paper fallback */
     }
   }
   if (pnl == null) {
-    pnl = pnlAt(side, entry, exit, Number(pos.qty), Number(pos.fees_usd));
+    const settled = netClosePnl({
+      side,
+      entry,
+      exit,
+      qty: Number(pos.qty),
+      riskUsd: Number(pos.risk_usd),
+      openFee: Number(pos.fees_usd),
+    });
+    pnl = settled.pnl;
+    if (fees == null) fees = settled.fees;
   }
-  const pnlR = slDist > 0 ? (side === "long" ? exit - entry : entry - exit) / slDist : 0;
-  return { exit, pnl, pnlR };
+  if (fees == null) {
+    const settled = netClosePnl({
+      side,
+      entry,
+      exit,
+      qty: Number(pos.qty),
+      riskUsd: Number(pos.risk_usd),
+      openFee: Number(pos.fees_usd),
+    });
+    fees = settled.fees;
+    if (pnl == null) pnl = settled.pnl;
+  }
+  const priceR = slDist > 0 ? (side === "long" ? exit - entry : entry - exit) / slDist : 0;
+  const pnlR = netPnlR(pnl, Number(pos.risk_usd), priceR);
+  return { exit, pnl, pnlR, fees };
 }
 
 async function confirmLiveFill(
@@ -478,6 +504,8 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   });
 
   let equity = Number(settings.equity_usd);
+  let usedMargin = usedMarginUsd(open);
+  let available = Math.max(0, equity - usedMargin);
   const wantLive = settings.mode === "live" && venue !== "paper";
   const live =
     wantLive &&
@@ -494,9 +522,10 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   let liveBookReady = !live;
   if (live && adapter) {
     try {
-      const bal = await adapter.fetchBalance(acc);
-      if (bal != null && Number.isFinite(bal)) {
-        equity = bal;
+      const w = await withTimeout(readVenueWallet(adapter, acc), 8000);
+      if (w) {
+        equity = w.equity;
+        available = w.available;
         liveBalReady = true;
         await setEquity(equity);
       }
@@ -505,6 +534,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     }
     if (!liveBalReady) {
       equity = 0;
+      available = 0;
     }
     try {
       const pending = await listOrphanFills();
@@ -568,7 +598,11 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
           }
           const resolved = await resolveLiveExit(adapter, acc, venue, pos, exitPx);
           const holdMs = Math.max(0, Date.now() - new Date(pos.opened_at).getTime());
-          await closePosition(pos.id, resolved.exit, "flatten retry", resolved.pnl, resolved.pnlR, { holdMs, beMoved: false });
+          await closePosition(pos.id, resolved.exit, "flatten retry", resolved.pnl, resolved.pnlR, {
+            holdMs,
+            beMoved: false,
+            feesUsd: resolved.fees,
+          });
           closed += 1;
           continue;
         }
@@ -616,7 +650,11 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
               }
               const resolved = await resolveLiveExit(adapter, acc, venue, pos, exitPx);
               const holdMs = Math.max(0, Date.now() - new Date(pos.opened_at).getTime());
-              await closePosition(pos.id, resolved.exit, "unprotected", resolved.pnl, resolved.pnlR, { holdMs, beMoved: false });
+              await closePosition(pos.id, resolved.exit, "unprotected", resolved.pnl, resolved.pnlR, {
+                holdMs,
+                beMoved: false,
+                feesUsd: resolved.fees,
+              });
               closed += 1;
               continue;
             }
@@ -731,14 +769,23 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
       const openMs = Number.isFinite(barTime) && barTime > 0 ? barTime : openedMs;
       const closeMs = walked.hit?.barTime ?? Date.now();
       let exit = walked.hit!.exit;
-      let pnl = pnlAt(side, entry, exit, Number(pos.qty), Number(pos.fees_usd));
-      const slDist = Math.abs(entry - origPx);
-      let pnlR = slDist > 0 ? (side === "long" ? exit - entry : entry - exit) / slDist : 0;
+      const settled = netClosePnl({
+        side,
+        entry,
+        exit,
+        qty: Number(pos.qty),
+        riskUsd: Number(pos.risk_usd),
+        openFee: Number(pos.fees_usd),
+      });
+      let pnl = settled.pnl;
+      let pnlR = settled.pnlR;
+      let fees = settled.fees;
       if (live && adapter && pos.mode === "live") {
         const resolved = await resolveLiveExit(adapter, acc, venue, pos, exit);
         exit = resolved.exit;
         pnl = resolved.pnl;
         pnlR = resolved.pnlR;
+        fees = resolved.fees;
       }
       await closePosition(pos.id, exit, why, pnl, pnlR, {
         maeR,
@@ -746,6 +793,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         barsHeld: walked.barsHeld,
         holdMs: Math.max(0, closeMs - openMs),
         beMoved: walked.beMoved,
+        feesUsd: fees,
       });
       if (live && pos.mode === "live") {
         /* equity comes from the venue wallet, not the paper delta */
@@ -758,6 +806,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   }
 
   let venueBook: Array<{ symbol: string; side: "long" | "short"; qty: number }> | null = null;
+  let walletAfterClose = false;
   if (live && adapter) {
     try {
       const exPos = await adapter.fetchPositions(acc);
@@ -780,7 +829,11 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         }
         const resolved = await resolveLiveExit(adapter, acc, venue, pos, exitPx);
         const holdMs = Math.max(0, Date.now() - new Date(pos.opened_at).getTime());
-        await closePosition(pos.id, resolved.exit, "venue", resolved.pnl, resolved.pnlR, { holdMs, beMoved: false });
+        await closePosition(pos.id, resolved.exit, "venue", resolved.pnl, resolved.pnlR, {
+          holdMs,
+          beMoved: false,
+          feesUsd: resolved.fees,
+        });
         closed += 1;
       }
     } catch {
@@ -789,23 +842,25 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     }
     if (liveBalReady) {
       try {
-        const bal = await adapter.fetchBalance(acc);
-        if (bal != null && Number.isFinite(bal)) {
-          equity = bal;
+        const w = await withTimeout(readVenueWallet(adapter, acc), 5000);
+        if (w) {
+          equity = w.equity;
+          available = w.available;
           await setEquity(equity);
+          walletAfterClose = true;
         }
       } catch {
-        /* keep last live equity */
+        /* keep last live wallet */
       }
     }
   }
 
   const stillOpen = await listOpenPositions();
   const held = new Set(stillOpen.map((p) => p.symbol));
-  let usedMargin = stillOpen.reduce(
-    (a, p) => a + Number(p.notional_usd) / Math.max(1, Number(p.leverage)),
-    0,
-  );
+  usedMargin = usedMarginUsd(stillOpen);
+  if (!walletAfterClose) {
+    available = Math.max(0, equity - usedMargin);
+  }
 
   const scanDone = {
     "5m": Number(settings.scan_done_5m) || 0,
@@ -1053,6 +1108,17 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     )
       skip = "already filled";
     else {
+      if (live && adapter && liveBalReady) {
+        try {
+          const w = await withTimeout(readVenueWallet(adapter, acc), 5000);
+          if (w) {
+            equity = w.equity;
+            available = Math.min(available, w.available);
+          }
+        } catch {
+          /* keep the last free pile */
+        }
+      }
       const coinMax = await coinMaxLev(s.symbol);
       const lev = Math.min(stackedUserLevCap(userLevCap, openLevs, stackCount, stackCap), coinMax);
       // Bucket on the coin's venue max, not the used (user/stack-capped) leverage.
@@ -1064,8 +1130,9 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         sl: s.sl,
         leverage: lev,
         usedMargin,
+        available,
       });
-      if (!sized) skip = "size failed";
+      if (!sized) skip = available <= 0 ? "no free capital" : "size failed";
       else {
         let orderId: string | undefined;
         let placedLive = false;
@@ -1284,6 +1351,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
                     used += 1;
                     opened += 1;
                     usedMargin += fillMargin;
+                    available = Math.max(0, available - fillMargin);
                     taken = true;
                     skip = ORPHAN_MARK;
                   } else {
@@ -1297,7 +1365,8 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
               openLevs.push(lev);
               used += 1;
               opened += 1;
-              usedMargin += sized.margin;
+              usedMargin += fillMargin;
+              available = Math.max(0, available - fillMargin);
               taken = true;
               if (orphan) skip = ORPHAN_MARK;
             }
@@ -1314,6 +1383,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
                     used += 1;
                     opened += 1;
                     usedMargin += fillMargin;
+                    available = Math.max(0, available - fillMargin);
                     taken = true;
                     skip = ORPHAN_MARK;
                   } else {
@@ -1354,10 +1424,10 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   const freshSettings = await getSettings();
   if (live && adapter && liveBalReady) {
     try {
-      const bal = await adapter.fetchBalance(acc);
-      if (bal != null && Number.isFinite(bal)) {
-        await setEquity(bal);
-        freshSettings.equity_usd = bal;
+      const w = await withTimeout(readVenueWallet(adapter, acc), 5000);
+      if (w) {
+        await setEquity(w.equity);
+        freshSettings.equity_usd = w.equity;
       }
     } catch {
       /* snapshot whatever is stored */

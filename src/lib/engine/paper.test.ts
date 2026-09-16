@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { closeFromVenueTrades, pathExcursion, rebaseStopsFromFill, sizePosition, walkPath } from "./paper.ts";
+import { closeFromVenueTrades, netClosePnl, pathExcursion, rebaseStopsFromFill, sizePosition, walkPath } from "./paper.ts";
 import type { Bar } from "./types.ts";
 
 function bar(i: number, o: Partial<Bar> = {}): Bar {
@@ -119,6 +119,23 @@ describe("closeFromVenueTrades", () => {
     assert.equal(Number(hit!.pnl.toFixed(4)), 3.52);
     assert.equal(Number(hit!.fees.toFixed(4)), 0.08);
   });
+
+  it("falls back to gross minus actual commissions when the venue omits realized PnL", () => {
+    const openedAt = Date.UTC(2024, 0, 1, 12);
+    const hit = closeFromVenueTrades({
+      side: "long",
+      entry: 100,
+      openedAt,
+      trades: [
+        { time: openedAt, side: "BUY", price: 100, qty: 2, realizedPnl: 0, commission: 0.08 },
+        { time: openedAt + 60_000, side: "SELL", price: 110, qty: 2, realizedPnl: 0, commission: 0.088 },
+      ],
+    });
+    assert.ok(hit);
+    assert.equal(hit!.exit, 110);
+    assert.equal(Number(hit!.fees.toFixed(4)), 0.168);
+    assert.equal(Number(hit!.pnl.toFixed(4)), 20 - 0.168);
+  });
 });
 
 describe("sizePosition — margin % × coin leverage", () => {
@@ -142,7 +159,39 @@ describe("sizePosition — margin % × coin leverage", () => {
     assert.equal(twentyFive.notional, 15_000);
   });
 
-  it("refuses a fill when free margin cannot cover the bucket", () => {
+  it("sizes each fill as a percent of remaining free capital, not total equity", () => {
+    const first = sizePosition({ equity: 10_000, capitalPct: 3, entry: 100, sl: 98, leverage: 25 });
+    assert.ok(first);
+    assert.equal(first.margin, 300);
+
+    const second = sizePosition({
+      equity: 10_000,
+      capitalPct: 15,
+      entry: 50,
+      sl: 49,
+      leverage: 5,
+      usedMargin: first.margin,
+    });
+    assert.ok(second);
+    assert.equal(second.margin, (10_000 - 300) * 0.15);
+    assert.equal(second.notional, second.margin * 5);
+  });
+
+  it("uses the live available pile and ignores locked margin", () => {
+    const sized = sizePosition({
+      equity: 10_000,
+      capitalPct: 15,
+      entry: 100,
+      sl: 98,
+      leverage: 5,
+      usedMargin: 9000,
+      available: 850,
+    });
+    assert.ok(sized);
+    assert.equal(sized.margin, 850 * 0.15);
+  });
+
+  it("sizes a leftover free pile instead of refusing the fill", () => {
     const sized = sizePosition({
       equity: 10_000,
       capitalPct: 15,
@@ -151,6 +200,37 @@ describe("sizePosition — margin % × coin leverage", () => {
       leverage: 5,
       usedMargin: 9200,
     });
+    assert.ok(sized);
+    assert.equal(Number(sized.margin.toFixed(6)), 120);
+  });
+
+  it("refuses when nothing is free", () => {
+    const sized = sizePosition({
+      equity: 10_000,
+      capitalPct: 15,
+      entry: 100,
+      sl: 98,
+      leverage: 5,
+      usedMargin: 10_000,
+    });
     assert.equal(sized, null);
+  });
+});
+
+describe("netClosePnl — journal writes net dollars after round-trip fees", () => {
+  it("subtracts open + close commission from gross and stores net R", () => {
+    const openFee = (100 * 1 * 4) / 10000;
+    const closeFee = (110 * 1 * 4) / 10000;
+    const settled = netClosePnl({
+      side: "long",
+      entry: 100,
+      exit: 110,
+      qty: 1,
+      riskUsd: 10,
+      openFee,
+    });
+    assert.equal(Number(settled.fees.toFixed(6)), Number((openFee + closeFee).toFixed(6)));
+    assert.equal(Number(settled.pnl.toFixed(6)), Number((10 - openFee - closeFee).toFixed(6)));
+    assert.equal(settled.pnlR, settled.pnl / 10);
   });
 });

@@ -15,7 +15,7 @@ import {
   nextAsterNonce,
   signAsterV3,
 } from "./aster-sign";
-import type { ExchangeAdapter, ExchangeAccount, ListedMarket, PlaceOrderInput, PlaceOrderResult, ProtectionSnapshot, UpdateStopInput, VenueTrade } from "./types";
+import type { ExchangeAdapter, ExchangeAccount, ListedMarket, PlaceOrderInput, PlaceOrderResult, ProtectionSnapshot, UpdateStopInput, VenueTrade, WalletSnapshot } from "./types";
 
 const BASE = "https://fapi.asterdex.com";
 
@@ -404,6 +404,37 @@ function flattenMessage(closed: PlaceOrderResult, why: string, orderId?: string)
   };
 }
 
+function numField(v: unknown) {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+/** Aster / Binance-style account payload → total equity + free capital. */
+export function parseAsterWallet(data: unknown): WalletSnapshot | null {
+  if (data == null) return null;
+  if (Array.isArray(data)) {
+    const rows = data as Array<Record<string, unknown>>;
+    const usdt = rows.find((r) => String(r.asset ?? "").toUpperCase() === "USDT") ?? rows[0];
+    if (!usdt) return null;
+    const available = numField(usdt.availableBalance ?? usdt.maxWithdrawAmount ?? usdt.balance);
+    const equity = numField(
+      usdt.marginBalance ?? usdt.crossWalletBalance ?? usdt.walletBalance ?? usdt.balance ?? available,
+    );
+    if (!Number.isFinite(available) && !Number.isFinite(equity)) return null;
+    const a = Number.isFinite(available) ? Math.max(0, available) : 0;
+    const e = Number.isFinite(equity) ? Math.max(0, equity) : a;
+    return { equity: e, available: a };
+  }
+  if (typeof data !== "object") return null;
+  const rec = data as Record<string, unknown>;
+  const available = numField(rec.availableBalance ?? rec.maxWithdrawAmount);
+  const equity = numField(rec.totalMarginBalance ?? rec.totalWalletBalance ?? rec.totalCrossWalletBalance ?? available);
+  if (!Number.isFinite(available) && !Number.isFinite(equity)) return null;
+  const a = Number.isFinite(available) ? Math.max(0, available) : 0;
+  const e = Number.isFinite(equity) ? Math.max(0, equity) : a;
+  return { equity: e, available: a };
+}
+
 export const asterAdapter: ExchangeAdapter = {
   id: "aster",
   label: "Aster",
@@ -472,15 +503,13 @@ export const asterAdapter: ExchangeAdapter = {
     }
     return venueMaxLeverage("aster", symbol);
   },
-  async fetchBalance(account) {
+  async fetchWallet(account) {
     const data = await signed(account, "GET", "/fapi/v2/account", {});
-    if (Array.isArray(data)) {
-      const rows = data as Array<{ asset?: string; availableBalance?: string; balance?: string; walletBalance?: string }>;
-      const usdt = rows.find((r) => r.asset === "USDT") ?? rows[0];
-      return Number(usdt?.availableBalance ?? usdt?.balance ?? usdt?.walletBalance ?? 0);
-    }
-    const rec = data as { totalWalletBalance?: string; availableBalance?: string };
-    return Number(rec.availableBalance ?? rec.totalWalletBalance ?? 0);
+    return parseAsterWallet(data);
+  },
+  async fetchBalance(account) {
+    const w = this.fetchWallet ? await this.fetchWallet(account) : null;
+    return w?.available ?? null;
   },
   async placeOrder(account, order: PlaceOrderInput): Promise<PlaceOrderResult> {
     try {

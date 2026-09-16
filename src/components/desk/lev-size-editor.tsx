@@ -46,8 +46,8 @@ export function LevSizeEditor({
         <h3 className="text-sm font-medium">{fa ? "سایز بر اساس اهرم ارز" : "Size by coin leverage"}</h3>
         <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted">
           {fa
-            ? "درصد پیش‌فرض برای همه ارزهاست. اگر سقف اهرم همان ارز دقیقاً با یک ردیف یکی باشد، درصد همان ردیف می‌رود تو معامله. حجم اسمی = درصد مارجین × اهرم."
-            : "Default % is used for every coin. If that coin's max leverage matches a row exactly, that row's % is the margin. Notional = margin % × leverage."}
+            ? "درصد از سرمایهٔ آزاد است. اگر سقف اهرم همان ارز دقیقاً با یک ردیف یکی باشد، درصد همان ردیف می‌رود تو معامله. حجم اسمی = درصد مارجین × اهرم."
+            : "Percent of free capital. If that coin's max leverage matches a row exactly, that row's % is the margin. Notional = margin % × leverage."}
         </p>
       </div>
 

@@ -273,7 +273,11 @@ function Home() {
         </div>
 
         <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
-          <Kpi label={t.equity} value={fmtUsd(s.equityUsd, 0)} hint={`${t.paper} / ${s.venue}`} />
+          <Kpi
+            label={t.equity}
+            value={fmtUsd(s.equityUsd, 0)}
+            hint={`${t.free} ${fmtUsd(s.availableUsd ?? s.equityUsd, 0)} · ${t.locked} ${fmtUsd(Math.max(0, s.equityUsd - (s.availableUsd ?? s.equityUsd)), 0)}`}
+          />
           <Kpi label={t.open} value={String(data.stats.open)} hint={`max ${s.maxPositions}`} />
           <Kpi
             label={t.winRate}
@@ -333,7 +337,8 @@ function Home() {
                 const venueLev = Number(btc?.max_leverage) || 25;
                 const lev = Math.min(userCap, venueLev);
                 const capN = capitalPctForLeverage(venueLev, Number(capital) || DEFAULT_CAPITAL_PCT, tiers);
-                const notional = s.equityUsd * (capN / 100) * lev;
+                const pile = s.availableUsd ?? s.equityUsd;
+                const notional = pile * (capN / 100) * lev;
                 const coin = btc?.base ?? "BTC";
                 return locale === "fa"
                   ? `۱ تا ۲۰۰. ربات از سقف خود ارز بالاتر نمی‌رود. الان: ${capN}٪ مارجین × ${lev}x روی ${coin} ≈ ${fmtUsd(notional, 0)} حجم · سقف ارز ${venueLev}x`
@@ -377,7 +382,7 @@ function Home() {
               tiers={tiers}
               onTiers={setTiers}
               disabled={!unlocked || saving}
-              equityUsd={s.equityUsd}
+              equityUsd={s.availableUsd ?? s.equityUsd}
               universe={data.universe}
             />
             <div className="grid gap-1.5">

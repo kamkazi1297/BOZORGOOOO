@@ -525,7 +525,7 @@ function BlotterTable({
               <th className="px-3 py-2 font-medium">{t.thInd}</th>
               <th className="px-3 py-2 font-medium">{t.thSide}</th>
               <th className="px-3 py-2 font-medium">R</th>
-              <th className="px-3 py-2 font-medium">$</th>
+              <th className="px-3 py-2 font-medium">{t.pnl}</th>
               <th className="px-3 py-2 font-medium">{t.thOut}</th>
               <th className="px-3 py-2 font-medium">{t.hold}</th>
             </tr>
@@ -730,10 +730,14 @@ function TradeDetail({
           </div>
         </div>
         <div>
-          <div className="text-xs text-subtle">PnL</div>
+          <div className="text-xs text-subtle">{t.pnl}</div>
           <div className={win === false ? "text-short" : "text-long"}>
             {row.status === "closed" ? fmtUsd(usd) : "—"}
           </div>
+        </div>
+        <div>
+          <div className="text-xs text-subtle">{t.fees}</div>
+          <div>{fmtUsd(num(row.fees_usd))}</div>
         </div>
       </div>
       <RiskPath row={row} t={t} />

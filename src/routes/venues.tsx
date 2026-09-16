@@ -347,7 +347,7 @@ function Page() {
           tiers={tiers}
           onTiers={setTiers}
           disabled={!unlocked}
-          equityUsd={s.equityUsd}
+          equityUsd={s.availableUsd ?? s.equityUsd}
           universe={data.universe}
         />
         <div className="grid gap-1.5">

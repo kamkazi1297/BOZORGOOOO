@@ -84,6 +84,13 @@ export type VenueTrade = {
   orderId?: string;
 };
 
+export type WalletSnapshot = {
+  /** Total wallet / margin balance (display). */
+  equity: number;
+  /** Free capital that can go into a new trade. */
+  available: number;
+};
+
 export type ExchangeAdapter = {
   id: VenueId;
   label: string;
@@ -94,6 +101,8 @@ export type ExchangeAdapter = {
   listMarkets(): Promise<ListedMarket[]>;
   fetchMaxLeverage(symbol: string, account?: ExchangeAccount): Promise<number>;
   fetchBalance(account: ExchangeAccount): Promise<number | null>;
+  /** Total + free. Live sizing uses `available` so locked margin is not counted twice. */
+  fetchWallet?(account: ExchangeAccount): Promise<WalletSnapshot | null>;
   placeOrder(account: ExchangeAccount, order: PlaceOrderInput): Promise<PlaceOrderResult>;
   /** Move the venue stop (TREX break-even). Must keep TP in place. */
   updateStop(account: ExchangeAccount, order: UpdateStopInput): Promise<PlaceOrderResult>;
