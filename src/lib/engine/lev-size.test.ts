@@ -6,6 +6,7 @@ import {
   capitalPctForLeverage,
   clampCapitalPct,
   notionalPctOfEquity,
+  parseCapitalBase,
   parseLevSizeTiers,
 } from "./lev-size.ts";
 
@@ -75,5 +76,13 @@ describe("lev-size buckets", () => {
     assert.equal(clampCapitalPct(Number.NaN), 3);
     assert.equal(clampCapitalPct(0), 1);
     assert.equal(clampCapitalPct(140), 100);
+  });
+
+  it("parses the capital base toggle, defaulting to total", () => {
+    assert.equal(parseCapitalBase("free"), "free");
+    assert.equal(parseCapitalBase("FREE"), "free");
+    assert.equal(parseCapitalBase("total"), "total");
+    assert.equal(parseCapitalBase(""), "total");
+    assert.equal(parseCapitalBase(null), "total");
   });
 });

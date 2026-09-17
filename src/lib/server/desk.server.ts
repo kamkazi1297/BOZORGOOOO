@@ -1,6 +1,6 @@
 import { getDbSource, getSql, isServerlessRuntime } from "@/lib/db";
 import { DEMO_JOURNAL } from "@/lib/engine/demo-journal";
-import { DEFAULT_CAPITAL_PCT, parseLevSizeTiers } from "@/lib/engine/lev-size";
+import { DEFAULT_CAPITAL_PCT, parseCapitalBase, parseLevSizeTiers } from "@/lib/engine/lev-size";
 import { bookVenue } from "@/lib/exchanges/meta";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -53,6 +53,7 @@ export type SettingsRow = {
   universe_venue?: string | null;
   engine_gates?: string | null;
   lev_size_tiers?: string | null;
+  capital_base?: string | null;
   updated_at: string;
 };
 
@@ -102,6 +103,7 @@ export function publicSettings(row: SettingsRow, opts?: { unlocked?: boolean }) 
     stackLevCount: Math.min(20, Math.max(0, Math.round(num(row.stack_lev_count, 2)))),
     stackLevCap: Math.min(200, Math.max(1, Math.round(num(row.stack_lev_cap, 75)))),
     levSizeTiers: parseLevSizeTiers(row.lev_size_tiers),
+    capitalBase: parseCapitalBase(row.capital_base),
     maxPositions: num(row.max_positions, 4),
     minMarketCapUsd: num(row.min_market_cap_usd, 0),
     equityUsd: num(row.equity_usd, 10000),
@@ -187,6 +189,7 @@ async function ensureTickHardeningColumns(sql: Awaited<ReturnType<typeof getSql>
     "alter table desk_settings add column if not exists stack_lev_count integer not null default 2",
     "alter table desk_settings add column if not exists stack_lev_cap integer not null default 75",
     "alter table desk_settings add column if not exists lev_size_tiers text not null default '[{\"leverage\":5,\"capitalPct\":15},{\"leverage\":10,\"capitalPct\":12},{\"leverage\":25,\"capitalPct\":6}]'",
+    "alter table desk_settings add column if not exists capital_base text not null default 'total'",
     "alter table desk_settings alter column capital_pct set default 3",
     "alter table desk_settings alter column venue set default 'aster'",
   ];
@@ -263,6 +266,7 @@ export type SettingsPatch = Partial<{
   stack_lev_count: number;
   stack_lev_cap: number;
   lev_size_tiers: string;
+  capital_base: string;
   max_positions: number;
   min_market_cap_usd: number;
   equity_usd: number;
@@ -296,6 +300,7 @@ export async function patchSettings(patch: SettingsPatch) {
     "stack_lev_count",
     "stack_lev_cap",
     "lev_size_tiers",
+    "capital_base",
     "max_positions",
     "min_market_cap_usd",
     "equity_usd",

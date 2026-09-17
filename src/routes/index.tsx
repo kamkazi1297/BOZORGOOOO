@@ -13,7 +13,7 @@ import { useLocale } from "@/lib/locale";
 import { fmtPct, fmtR, fmtUsd, millionsToUsd, usdToMillions } from "@/lib/utils";
 import { CRON_STALE_MS } from "@/lib/engine/scan-schedule";
 import { bookVenue, chartHostLabel, venueLabel } from "@/lib/exchanges/meta";
-import { DEFAULT_CAPITAL_PCT, DEFAULT_LEV_SIZE_TIERS, capitalPctForLeverage } from "@/lib/engine/lev-size";
+import { DEFAULT_CAPITAL_PCT, DEFAULT_LEV_SIZE_TIERS, capitalPctForLeverage, type CapitalBase } from "@/lib/engine/lev-size";
 
 export const Route = createFileRoute("/")({
   loader: () => getDesk(),
@@ -31,6 +31,7 @@ function Home() {
   const [busy, setBusy] = useState(false);
   const [saving, setSaving] = useState(false);
   const [capital, setCapital] = useState(String(s.capitalPct ?? DEFAULT_CAPITAL_PCT));
+  const [capitalBase, setCapitalBase] = useState<CapitalBase>(s.capitalBase === "free" ? "free" : "total");
   const [batch, setBatch] = useState(String(s.scanBatch ?? 0));
   const [maxPos, setMaxPos] = useState(String(s.maxPositions ?? 4));
   const [maxLev, setMaxLev] = useState(String(s.maxLeverage ?? 200));
@@ -42,6 +43,7 @@ function Home() {
 
   useEffect(() => {
     setCapital(String(s.capitalPct ?? DEFAULT_CAPITAL_PCT));
+    setCapitalBase(s.capitalBase === "free" ? "free" : "total");
     setBatch(String(s.scanBatch ?? 0));
     setMaxPos(String(s.maxPositions ?? 4));
     setMaxLev(String(s.maxLeverage ?? 200));
@@ -49,7 +51,7 @@ function Home() {
     setStackCap(String(s.stackLevCap ?? 75));
     setTiers(s.levSizeTiers ?? DEFAULT_LEV_SIZE_TIERS);
     setMinCap(String(usdToMillions(s.minMarketCapUsd)));
-  }, [s.capitalPct, s.scanBatch, s.maxPositions, s.maxLeverage, s.stackLevCount, s.stackLevCap, s.levSizeTiers, s.minMarketCapUsd]);
+  }, [s.capitalPct, s.capitalBase, s.scanBatch, s.maxPositions, s.maxLeverage, s.stackLevCount, s.stackLevCap, s.levSizeTiers, s.minMarketCapUsd]);
   const pnl = Number(data.stats.pnl);
   const curve = data.equity.map((e) => ({
     t: new Date(e.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
@@ -64,6 +66,7 @@ function Home() {
       const saved = await saveDeskSettings({
         data: {
           capital_pct: Math.min(100, Math.max(1, Number(capital) || DEFAULT_CAPITAL_PCT)),
+          capital_base: capitalBase,
           scan_batch: Math.min(250, Math.max(0, Math.round(Number(batch) || 0))),
           max_positions: Math.min(20, Math.max(1, Math.round(Number(maxPos) || 4))),
           max_leverage: Math.min(200, Math.max(1, Math.round(Number(maxLev) || 200))),
@@ -74,6 +77,7 @@ function Home() {
         },
       });
       setCapital(String(saved.capitalPct ?? capital));
+      setCapitalBase(saved.capitalBase === "free" ? "free" : "total");
       setBatch(String(saved.scanBatch ?? batch));
       setMaxPos(String(saved.maxPositions ?? maxPos));
       setMaxLev(String(saved.maxLeverage ?? maxLev));
@@ -337,7 +341,7 @@ function Home() {
                 const venueLev = Number(btc?.max_leverage) || 25;
                 const lev = Math.min(userCap, venueLev);
                 const capN = capitalPctForLeverage(venueLev, Number(capital) || DEFAULT_CAPITAL_PCT, tiers);
-                const pile = s.availableUsd ?? s.equityUsd;
+                const pile = capitalBase === "free" ? (s.availableUsd ?? s.equityUsd) : s.equityUsd;
                 const notional = pile * (capN / 100) * lev;
                 const coin = btc?.base ?? "BTC";
                 return locale === "fa"
@@ -379,10 +383,12 @@ function Home() {
             <LevSizeEditor
               capital={capital}
               onCapital={setCapital}
+              capitalBase={capitalBase}
+              onCapitalBase={setCapitalBase}
               tiers={tiers}
               onTiers={setTiers}
               disabled={!unlocked || saving}
-              equityUsd={s.availableUsd ?? s.equityUsd}
+              equityUsd={capitalBase === "free" ? (s.availableUsd ?? s.equityUsd) : s.equityUsd}
               universe={data.universe}
             />
             <div className="grid gap-1.5">

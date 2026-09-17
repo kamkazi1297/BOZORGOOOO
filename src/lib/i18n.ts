@@ -38,7 +38,12 @@ export const copy = {
     risk: "ریسک هر معامله",
     capital: "درصد سرمایه",
     capitalHint:
-      "درصد از سرمایهٔ آزاد است، نه کل سرمایه. پولی که الان در معامله باز است حساب نمی‌شود. در لایو هر بار موجودی واقعی صرافی خوانده می‌شود. برای ارزهایی که اهرمشان دقیقاً ۵، ۱۰ یا ۲۵ است درصد جدا می‌گذاری. همه این عددها از تنظیمات عوض می‌شوند.",
+      "از میز انتخاب می‌کنی درصد از کل حساب باشد یا از پول آزاد. در هر دو حالت بیشتر از پول آزاد وارد معامله نمی‌شود. در لایو موجودی واقعی صرافی خوانده می‌شود. برای ارزهایی که اهرمشان دقیقاً ۵، ۱۰ یا ۲۵ است درصد جدا می‌گذاری.",
+    capitalBase: "پایه درصد",
+    capitalBaseTotal: "از کل سرمایه",
+    capitalBaseFree: "از سرمایه آزاد",
+    capitalBaseHint:
+      "از کل: همیشه همان درصد از کل حساب؛ اگر آزاد کمتر بود همان آزاد می‌رود. از آزاد: درصد از پولی که الان درگیر نیست.",
     scanBatch: "ارز در هر تیک",
     autoLev: "حداکثر اهرم (قابل تنظیم)",
     stackLev: "سقف اهرم با چند معاملهٔ همزمان",
@@ -202,7 +207,12 @@ export const copy = {
     risk: "Risk per trade",
     capital: "Capital %",
     capitalHint:
-      "Percent of FREE capital, not total equity. Margin already in open trades is ignored. Live always sizes from the venue wallet. Coins whose max leverage is exactly 5, 10 or 25 use their own %. Every number is editable in settings.",
+      "Pick whether the % is of total equity or of free cash. Either way a fill never spends more than free cash. Live reads the real venue wallet. Coins whose max leverage is exactly 5, 10 or 25 use their own %.",
+    capitalBase: "Size from",
+    capitalBaseTotal: "Total equity",
+    capitalBaseFree: "Free cash",
+    capitalBaseHint:
+      "Total: always that % of the whole account; if free is smaller, free is used. Free: % of cash not already in a trade.",
     scanBatch: "Coins per tick",
     autoLev: "Max leverage (you set this)",
     stackLev: "Stack cap (high-leverage concurrent)",

@@ -124,6 +124,7 @@ export const saveDeskSettings = createServerFn({ method: "POST" })
         )
         .max(20)
         .optional(),
+      capital_base: z.enum(["total", "free"]).optional(),
       max_positions: z.number().int().min(1).max(20).optional(),
       min_market_cap_usd: z.number().min(0).max(5e12).optional(),
       equity_usd: z.number().positive().optional(),

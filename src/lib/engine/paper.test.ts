@@ -160,7 +160,7 @@ describe("sizePosition — margin % × coin leverage", () => {
   });
 
   it("sizes each fill as a percent of remaining free capital, not total equity", () => {
-    const first = sizePosition({ equity: 10_000, capitalPct: 3, entry: 100, sl: 98, leverage: 25 });
+    const first = sizePosition({ equity: 10_000, capitalPct: 3, entry: 100, sl: 98, leverage: 25, capitalBase: "free" });
     assert.ok(first);
     assert.equal(first.margin, 300);
 
@@ -171,10 +171,29 @@ describe("sizePosition — margin % × coin leverage", () => {
       sl: 49,
       leverage: 5,
       usedMargin: first.margin,
+      capitalBase: "free",
     });
     assert.ok(second);
     assert.equal(second.margin, (10_000 - 300) * 0.15);
     assert.equal(second.notional, second.margin * 5);
+  });
+
+  it("from total equity keeps 15% of the whole account on the second fill", () => {
+    const first = sizePosition({ equity: 10_000, capitalPct: 3, entry: 100, sl: 98, leverage: 25, capitalBase: "total" });
+    assert.ok(first);
+    assert.equal(first.margin, 300);
+
+    const second = sizePosition({
+      equity: 10_000,
+      capitalPct: 15,
+      entry: 50,
+      sl: 49,
+      leverage: 5,
+      usedMargin: first.margin,
+      capitalBase: "total",
+    });
+    assert.ok(second);
+    assert.equal(second.margin, 1500);
   });
 
   it("uses the live available pile and ignores locked margin", () => {
@@ -186,9 +205,24 @@ describe("sizePosition — margin % × coin leverage", () => {
       leverage: 5,
       usedMargin: 9000,
       available: 850,
+      capitalBase: "free",
     });
     assert.ok(sized);
     assert.equal(sized.margin, 850 * 0.15);
+  });
+
+  it("from total still never spends more than free cash", () => {
+    const sized = sizePosition({
+      equity: 10_000,
+      capitalPct: 15,
+      entry: 100,
+      sl: 98,
+      leverage: 5,
+      usedMargin: 9200,
+      capitalBase: "total",
+    });
+    assert.ok(sized);
+    assert.equal(Number(sized.margin.toFixed(6)), 800 * 0.995);
   });
 
   it("sizes a leftover free pile instead of refusing the fill", () => {
@@ -199,6 +233,7 @@ describe("sizePosition — margin % × coin leverage", () => {
       sl: 98,
       leverage: 5,
       usedMargin: 9200,
+      capitalBase: "free",
     });
     assert.ok(sized);
     assert.equal(Number(sized.margin.toFixed(6)), 120);

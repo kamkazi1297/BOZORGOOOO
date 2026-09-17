@@ -155,6 +155,8 @@ export default defineConfig(({ command, isPreview }) => ({
     host: "127.0.0.1",
     port: 8081,
     strictPort: true,
+    // Render / any public hostname. Default Vite preview only allows localhost.
+    allowedHosts: true,
   },
   resolve: { tsconfigPaths: true },
   plugins: [

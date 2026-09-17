@@ -5,13 +5,21 @@ export type LevSizeTier = {
   capitalPct: number;
 };
 
+/** Where capital % is measured from. Live always caps at free cash. */
+export type CapitalBase = "total" | "free";
+
 export const DEFAULT_CAPITAL_PCT = 3;
+export const DEFAULT_CAPITAL_BASE: CapitalBase = "total";
 
 export const DEFAULT_LEV_SIZE_TIERS: LevSizeTier[] = [
   { leverage: 5, capitalPct: 15 },
   { leverage: 10, capitalPct: 12 },
   { leverage: 25, capitalPct: 6 },
 ];
+
+export function parseCapitalBase(raw: unknown): CapitalBase {
+  return String(raw ?? "").trim().toLowerCase() === "free" ? "free" : "total";
+}
 
 export function clampCapitalPct(n: number, fallback = DEFAULT_CAPITAL_PCT) {
   const v = Number(n);

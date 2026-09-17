@@ -4,7 +4,7 @@ import { fetchVenueLastPrice } from "@/lib/market/venues";
 import { onlyClosedBars, scanBarClosed } from "@/lib/engine/run";
 import { parseEngineGates, parseSideGates, scanNames, isSideOn } from "@/lib/engine/engine-gates";
 import { origStopPx, pathExcursion, rebaseStopsFromFill, closeFromVenueTrades, sizePosition, walkPath, netClosePnl, netPnlR } from "@/lib/engine/paper";
-import { capitalPctForLeverage, DEFAULT_CAPITAL_PCT, parseLevSizeTiers } from "@/lib/engine/lev-size";
+import { capitalPctForLeverage, DEFAULT_CAPITAL_PCT, parseCapitalBase, parseLevSizeTiers } from "@/lib/engine/lev-size";
 import {
   barFillKey,
   fillCoin,
@@ -1085,6 +1085,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   const remainingSlots = slotsLeft(settings.max_positions, stillOpen.length, venueBook?.length ?? 0);
   let used = 0;
   const capitalPctDefault = Number(settings.capital_pct) || DEFAULT_CAPITAL_PCT;
+  const capitalBase = parseCapitalBase(settings.capital_base);
   const levSizeTiers = parseLevSizeTiers(settings.lev_size_tiers);
   const userLevCap = Math.min(200, Math.max(1, Math.round(Number(settings.max_leverage) || 200)));
   const rawStackCount = Number(settings.stack_lev_count);
@@ -1159,6 +1160,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         leverage: lev,
         usedMargin,
         available,
+        capitalBase,
       });
       if (!sized) skip = available <= 0 ? "no free capital" : "size failed";
       else {

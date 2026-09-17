@@ -1,4 +1,5 @@
 import { FEE_BPS, type Bar, type Signal, type Side } from "./types.ts";
+import type { CapitalBase } from "./lev-size.ts";
 
 const EPS = 1e-10;
 
@@ -26,7 +27,11 @@ export type PaperExit = PaperFill & {
   closedBarTime: number;
 };
 
-/** Margin = capitalPct of FREE capital. Locked margin is ignored. Notional = margin × leverage. */
+/**
+ * Margin = capitalPct of total equity or of free cash.
+ * Always capped at free so a fill cannot spend locked margin.
+ * Notional = margin × leverage.
+ */
 export function sizePosition(opts: {
   equity: number;
   capitalPct: number;
@@ -34,8 +39,10 @@ export function sizePosition(opts: {
   sl: number;
   leverage: number;
   usedMargin?: number;
-  /** If set, this is the free pile to size from (live wallet). Otherwise free = equity − usedMargin. */
+  /** If set, this is the free pile (live wallet). Otherwise free = equity − usedMargin. */
   available?: number;
+  /** total = % of whole account (default). free = % of leftover cash. */
+  capitalBase?: CapitalBase;
 }) {
   const lev = Math.max(1, opts.leverage);
   const pct = Math.min(100, Math.max(1, opts.capitalPct));
@@ -43,7 +50,8 @@ export function sizePosition(opts: {
     opts.available != null && Number.isFinite(opts.available)
       ? Math.max(0, opts.available)
       : Math.max(0, opts.equity - Math.max(0, opts.usedMargin ?? 0));
-  const want = free * (pct / 100);
+  const pile = opts.capitalBase === "free" ? free : Math.max(0, opts.equity);
+  const want = pile * (pct / 100);
   if (!(want > 0) || !(opts.entry > 0) || !(free > 0)) return null;
   const margin = Math.min(want, free * 0.995);
   if (!(margin > 0)) return null;

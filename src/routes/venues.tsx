@@ -11,7 +11,7 @@ import { getDesk, saveDeskSettings, testVenue } from "@/lib/server/functions";
 import { useLocale } from "@/lib/locale";
 import type { VenueId } from "@/lib/engine/types";
 import { millionsToUsd, usdToMillions } from "@/lib/utils";
-import { DEFAULT_CAPITAL_PCT, DEFAULT_LEV_SIZE_TIERS } from "@/lib/engine/lev-size";
+import { DEFAULT_CAPITAL_PCT, DEFAULT_LEV_SIZE_TIERS, type CapitalBase } from "@/lib/engine/lev-size";
 
 export const Route = createFileRoute("/venues")({
   loader: () => getDesk(),
@@ -27,6 +27,7 @@ function Page() {
   const [mode, setMode] = useState(s.mode);
   const [venue, setVenue] = useState(s.venue);
   const [capital, setCapital] = useState(String(s.capitalPct ?? DEFAULT_CAPITAL_PCT));
+  const [capitalBase, setCapitalBase] = useState<CapitalBase>(s.capitalBase === "free" ? "free" : "total");
   const [maxLev, setMaxLev] = useState(String(s.maxLeverage ?? 200));
   const [stackCount, setStackCount] = useState(String(s.stackLevCount ?? 2));
   const [stackCap, setStackCap] = useState(String(s.stackLevCap ?? 75));
@@ -58,6 +59,7 @@ function Page() {
     setMode(s.mode);
     setVenue(s.venue);
     setCapital(String(s.capitalPct ?? DEFAULT_CAPITAL_PCT));
+    setCapitalBase(s.capitalBase === "free" ? "free" : "total");
     setMaxLev(String(s.maxLeverage ?? 200));
     setStackCount(String(s.stackLevCount ?? 2));
     setStackCap(String(s.stackLevCap ?? 75));
@@ -72,6 +74,7 @@ function Page() {
     s.mode,
     s.venue,
     s.capitalPct,
+    s.capitalBase,
     s.maxLeverage,
     s.stackLevCount,
     s.stackLevCap,
@@ -94,6 +97,7 @@ function Page() {
           mode,
           venue: venue as VenueId,
           capital_pct: Math.min(100, Math.max(1, Number(capital) || DEFAULT_CAPITAL_PCT)),
+          capital_base: capitalBase,
           max_leverage: Math.min(200, Math.max(1, Math.round(Number(maxLev) || 200))),
           stack_lev_count: Math.min(20, Math.max(0, Math.round(Number(stackCount) || 0))),
           stack_lev_cap: Math.min(200, Math.max(1, Math.round(Number(stackCap) || 75))),
@@ -117,6 +121,7 @@ function Page() {
         },
       });
       setCapital(String(saved.capitalPct ?? capital));
+      setCapitalBase(saved.capitalBase === "free" ? "free" : "total");
       setMaxLev(String(saved.maxLeverage ?? maxLev));
       setStackCount(String(saved.stackLevCount ?? stackCount));
       setStackCap(String(saved.stackLevCap ?? stackCap));
@@ -344,10 +349,12 @@ function Page() {
         <LevSizeEditor
           capital={capital}
           onCapital={setCapital}
+          capitalBase={capitalBase}
+          onCapitalBase={setCapitalBase}
           tiers={tiers}
           onTiers={setTiers}
           disabled={!unlocked}
-          equityUsd={s.availableUsd ?? s.equityUsd}
+          equityUsd={capitalBase === "free" ? (s.availableUsd ?? s.equityUsd) : s.equityUsd}
           universe={data.universe}
         />
         <div className="grid gap-1.5">

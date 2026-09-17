@@ -7,6 +7,7 @@ import {
   capitalPctForLeverage,
   clampCapitalPct,
   notionalPctOfEquity,
+  type CapitalBase,
   type LevSizeTier,
 } from "@/lib/engine/lev-size";
 import { useLocale } from "@/lib/locale";
@@ -16,6 +17,8 @@ type Coin = { base?: string; max_leverage?: number };
 export function LevSizeEditor({
   capital,
   onCapital,
+  capitalBase,
+  onCapitalBase,
   tiers,
   onTiers,
   disabled,
@@ -24,13 +27,15 @@ export function LevSizeEditor({
 }: {
   capital: string;
   onCapital: (v: string) => void;
+  capitalBase: CapitalBase;
+  onCapitalBase: (v: CapitalBase) => void;
   tiers: LevSizeTier[];
   onTiers: (v: LevSizeTier[]) => void;
   disabled?: boolean;
   equityUsd?: number;
   universe?: Coin[];
 }) {
-  const { locale } = useLocale();
+  const { locale, t } = useLocale();
   const fa = locale === "fa";
   const defaultPct = clampCapitalPct(Number(capital) || DEFAULT_CAPITAL_PCT);
 
@@ -46,9 +51,31 @@ export function LevSizeEditor({
         <h3 className="text-sm font-medium">{fa ? "سایز بر اساس اهرم ارز" : "Size by coin leverage"}</h3>
         <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted">
           {fa
-            ? "درصد از سرمایهٔ آزاد است. اگر سقف اهرم همان ارز دقیقاً با یک ردیف یکی باشد، درصد همان ردیف می‌رود تو معامله. حجم اسمی = درصد مارجین × اهرم."
-            : "Percent of free capital. If that coin's max leverage matches a row exactly, that row's % is the margin. Notional = margin % × leverage."}
+            ? "اگر سقف اهرم همان ارز دقیقاً با یک ردیف یکی باشد، درصد همان ردیف می‌رود تو معامله. حجم اسمی = درصد مارجین × اهرم."
+            : "If that coin's max leverage matches a row exactly, that row's % is the margin. Notional = margin % × leverage."}
         </p>
+      </div>
+
+      <div className="grid gap-1.5">
+        <Label>{t.capitalBase}</Label>
+        <div className="grid grid-cols-2 gap-2 sm:max-w-md">
+          {(["total", "free"] as const).map((base) => (
+            <button
+              key={base}
+              type="button"
+              disabled={disabled}
+              onClick={() => onCapitalBase(base)}
+              className={`min-h-11 rounded-sm border px-3 text-sm ${
+                capitalBase === base
+                  ? "border-accent bg-surface text-fg"
+                  : "border-border text-muted hover:border-border-strong"
+              } disabled:opacity-40`}
+            >
+              {base === "total" ? t.capitalBaseTotal : t.capitalBaseFree}
+            </button>
+          ))}
+        </div>
+        <p className="max-w-2xl text-xs leading-relaxed text-subtle">{t.capitalBaseHint}</p>
       </div>
 
       <div className="grid gap-1.5 sm:max-w-xs">
