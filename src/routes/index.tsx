@@ -484,6 +484,7 @@ function Home() {
                   </button>
                 ))}
               </div>
+              <p className="text-xs text-subtle">{t.maxPosHint}</p>
             </div>
             <div className="flex items-end">
               <Button className="w-full" onClick={saveSizing} disabled={!unlocked || saving}>

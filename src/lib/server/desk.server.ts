@@ -413,6 +413,20 @@ export async function listOpenPositions() {
   }));
 }
 
+export async function listBarFills(sinceBarTime: number) {
+  const sql = await getSql();
+  try {
+    return await sql<{ symbol: string; timeframe: string; bar_time: number }>`
+      select symbol, timeframe, bar_time from positions
+      where bar_time is not null and bar_time <> 0 and bar_time >= ${sinceBarTime}
+    `;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/bar_time|does not exist/i.test(msg)) return [];
+    throw err;
+  }
+}
+
 export async function listClosedPositions(limit = 80) {
   const sql = await getSql();
   const rows = await sql<PositionRow & { size?: number }>`
@@ -600,7 +614,6 @@ export async function alreadyFilled(opts: {
       select id from positions
       where symbol = ${opts.symbol}
         and timeframe = ${opts.timeframe}
-        and indicator = ${opts.indicator}
         and bar_time = ${opts.barTime}
       limit 1
     `;

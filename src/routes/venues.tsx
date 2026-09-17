@@ -360,6 +360,7 @@ function Page() {
             disabled={!unlocked}
             onChange={(e) => setMaxPos(e.target.value)}
           />
+          <p className="text-xs text-subtle">{t.maxPosHint}</p>
         </div>
         <div className="grid gap-1.5">
           <Label>{locale === "fa" ? "ارز در هر تیک (۰ = همه)" : "Coins per tick (0 = all)"}</Label>

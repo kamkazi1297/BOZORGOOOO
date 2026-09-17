@@ -5,6 +5,15 @@ import { onlyClosedBars, scanBarClosed } from "@/lib/engine/run";
 import { parseEngineGates, parseSideGates, scanNames, isSideOn } from "@/lib/engine/engine-gates";
 import { origStopPx, pathExcursion, rebaseStopsFromFill, closeFromVenueTrades, sizePosition, walkPath, netClosePnl, netPnlR } from "@/lib/engine/paper";
 import { capitalPctForLeverage, DEFAULT_CAPITAL_PCT, parseLevSizeTiers } from "@/lib/engine/lev-size";
+import {
+  barFillKey,
+  fillCoin,
+  heldCoins as coinsHeld,
+  leverageOverCap,
+  marginOverBudget,
+  remainingSlots as slotsLeft,
+  skipFill,
+} from "@/lib/engine/fill-gates";
 import { FEE_BPS, HTF2_OF, HTF_OF, TF_MS, WARMUP, type KlineTf, type Timeframe, type VenueId } from "@/lib/engine/types";
 import {
   dueTimeframes,
@@ -32,6 +41,7 @@ import {
   heartbeatTickLock,
   insertPosition,
   insertSignal,
+  listBarFills,
   listOpenPositions,
   listOrphanFills,
   listUniverse,
@@ -856,7 +866,21 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   }
 
   const stillOpen = await listOpenPositions();
-  const held = new Set(stillOpen.map((p) => p.symbol));
+  const held = coinsHeld(
+    stillOpen.map((p) => p.symbol),
+    venueBook?.map((p) => p.symbol),
+  );
+  const filledBars = new Set<string>();
+  try {
+    const recent = await listBarFills(Date.now() - TF_MS["4h"] * 2);
+    for (const row of recent) {
+      filledBars.add(barFillKey(row.symbol, row.timeframe, Number(row.bar_time)));
+    }
+  } catch {
+    for (const p of stillOpen) {
+      if (p.bar_time) filledBars.add(barFillKey(p.symbol, p.timeframe, Number(p.bar_time)));
+    }
+  }
   usedMargin = usedMarginUsd(stillOpen);
   if (!walletAfterClose) {
     available = Math.max(0, equity - usedMargin);
@@ -1058,7 +1082,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   }
 
   signals = found.length;
-  const remainingSlots = Math.max(0, Number(settings.max_positions) - (await listOpenPositions()).length);
+  const remainingSlots = slotsLeft(settings.max_positions, stillOpen.length, venueBook?.length ?? 0);
   let used = 0;
   const capitalPctDefault = Number(settings.capital_pct) || DEFAULT_CAPITAL_PCT;
   const levSizeTiers = parseLevSizeTiers(settings.lev_size_tiers);
@@ -1081,33 +1105,37 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   for (const s of found) {
     let taken = false;
     let skip = "";
+    const coin = fillCoin(s.symbol);
+    const barKey = barFillKey(s.symbol, s.timeframe, s.barTime);
     const stale = (live || opts.source !== "manual") && !isFreshSignal(s.barTime, s.timeframe, Date.now());
-    if (stale) skip = "stale bar";
-    else if (!isSideOn(sideGates, s.indicator, s.side)) skip = "side muted";
-    else if (held.has(s.symbol)) skip = "already in symbol";
-    else if (
-      live &&
-      venueBook &&
-      venueBook.some((p) => sameCoin(p.symbol, s.symbol) || sameCoin(p.symbol, venueSymbol(venue, s.symbol)))
-    )
-      skip = "already on venue";
-    else if (live && (!liveBalReady || !liveBookReady))
-      skip = !liveBalReady
-        ? "live balance unread — not sending"
-        : "live positions unread — not sending";
-    else if (used >= remainingSlots) skip = "max positions";
-    else if (
-      await alreadyFilled({
-        symbol: s.symbol,
-        timeframe: s.timeframe,
-        indicator: s.indicator,
-        side: s.side,
-        entry: s.entry,
-        barTime: s.barTime,
-      })
-    )
+    skip = skipFill({
+      stale,
+      sideOn: isSideOn(sideGates, s.indicator, s.side),
+      coin,
+      barKey,
+      held,
+      filledBars,
+      used,
+      remaining: remainingSlots,
+      liveUnread:
+        live && (!liveBalReady || !liveBookReady)
+          ? !liveBalReady
+            ? "live balance unread — not sending"
+            : "live positions unread — not sending"
+          : "",
+    });
+    if (!skip && (await alreadyFilled({
+      symbol: s.symbol,
+      timeframe: s.timeframe,
+      indicator: s.indicator,
+      side: s.side,
+      entry: s.entry,
+      barTime: s.barTime,
+    }))) {
       skip = "already filled";
-    else {
+      filledBars.add(barKey);
+    }
+    if (!skip) {
       if (live && adapter && liveBalReady) {
         try {
           const w = await withTimeout(readVenueWallet(adapter, acc), 5000);
@@ -1143,6 +1171,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         let liveFillTp = s.tp;
         let liveFillFees = sized.fees;
         let liveStopsPlaced = false;
+        let liveLevActual = 0;
         if (liveBlock) skip = liveBlock;
         else if (live) {
           const ad = getAdapter(venue);
@@ -1150,6 +1179,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
           else if (!hasLiveKeys(settings, venue)) skip = `${venue} keys missing`;
           else if (!(await heartbeatTickLock(opts.lock))) skip = "tick lock lost";
           else {
+            held.add(coin);
             try {
               const res = await ad.placeOrder(acc, {
                 symbol: venueSymbol(venue, s.symbol),
@@ -1218,6 +1248,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
                 /* keep skip; nothing confirmed on venue */
               }
             }
+            if (!placedLive) held.delete(coin);
           }
         }
         if (placedLive && adapter) {
@@ -1229,6 +1260,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
             if (hit) {
               if (hit.entry > 0) liveFillPx = hit.entry;
               if (hit.qty > 0) liveFillQty = hit.qty;
+              if (hit.leverage > 0) liveLevActual = hit.leverage;
             }
           } catch {
             /* keep order result */
@@ -1267,7 +1299,8 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
           const fillSl = liveFillSl;
           const fillTp = liveFillTp;
           const fillNotional = fillQty * fillEntry;
-          const fillMargin = fillNotional / Math.max(1, lev);
+          const fillLev = liveLevActual > 0 ? liveLevActual : lev;
+          const fillMargin = fillNotional / Math.max(1, fillLev);
           const fillRisk = fillQty * Math.abs(fillEntry - fillSl);
           const fillFees = liveFillPx > 0 ? (liveFillFees || (fillNotional * FEE_BPS) / 10000) : sized.fees;
           const fill = {
@@ -1281,7 +1314,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
             sl: fillSl,
             tp: fillTp,
             qty: fillQty,
-            leverage: lev,
+            leverage: Math.min(fillLev, lev),
             notional: fillNotional || sized.notional,
             risk: fillRisk || sized.risk,
             fees: fillFees,
@@ -1302,6 +1335,28 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
             } catch {
               return false;
             }
+          }
+          let bookFill = true;
+          if (placedLive && (leverageOverCap(fillLev, lev) || marginOverBudget(fillMargin, sized.margin))) {
+            skip = leverageOverCap(fillLev, lev) ? "leverage over cap" : "margin over cap";
+            const flat = await flattenLive();
+            if (flat) {
+              bookFill = false;
+              held.delete(coin);
+              filledBars.add(barKey);
+            } else {
+              orphan = true;
+            }
+          }
+          function markTaken() {
+            held.add(coin);
+            filledBars.add(barKey);
+            openLevs.push(Math.min(fillLev, lev));
+            used += 1;
+            opened += 1;
+            usedMargin += fillMargin;
+            available = Math.max(0, available - fillMargin);
+            taken = true;
           }
           async function bookOrphan() {
             return insertPosition({ ...fill, signalReason: `${s.reason} · ${ORPHAN_MARK}` });
@@ -1337,37 +1392,32 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
               return false;
             }
           }
+          if (bookFill) {
           try {
-            const id = await insertPosition({ ...fill, signalReason: reason });
+            const id = await insertPosition({
+              ...fill,
+              signalReason: orphan ? `${s.reason} · ${ORPHAN_MARK}` : reason,
+            });
             if (!id) {
               skip = "already filled";
+              filledBars.add(barKey);
               if (placedLive) {
                 const flat = await flattenLive();
                 if (!flat) {
                   const retry = await bookOrphan().catch(() => 0);
                   if (retry) {
-                    held.add(s.symbol);
-                    openLevs.push(lev);
-                    used += 1;
-                    opened += 1;
-                    usedMargin += fillMargin;
-                    available = Math.max(0, available - fillMargin);
-                    taken = true;
+                    markTaken();
                     skip = ORPHAN_MARK;
                   } else {
                     await stashOrphan();
                     skip = ORPHAN_MARK;
                   }
+                } else {
+                  held.delete(coin);
                 }
               }
             } else {
-              held.add(s.symbol);
-              openLevs.push(lev);
-              used += 1;
-              opened += 1;
-              usedMargin += fillMargin;
-              available = Math.max(0, available - fillMargin);
-              taken = true;
+              markTaken();
               if (orphan) skip = ORPHAN_MARK;
             }
           } catch (e) {
@@ -1378,13 +1428,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
                 try {
                   const retry = await bookOrphan();
                   if (retry) {
-                    held.add(s.symbol);
-                    openLevs.push(lev);
-                    used += 1;
-                    opened += 1;
-                    usedMargin += fillMargin;
-                    available = Math.max(0, available - fillMargin);
-                    taken = true;
+                    markTaken();
                     skip = ORPHAN_MARK;
                   } else {
                     await stashOrphan();
@@ -1394,8 +1438,11 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
                   await stashOrphan();
                   skip = ORPHAN_MARK;
                 }
+              } else {
+                held.delete(coin);
               }
             }
+          }
           }
         }
       }

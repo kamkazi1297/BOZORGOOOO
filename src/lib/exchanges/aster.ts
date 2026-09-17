@@ -143,8 +143,21 @@ async function asterPositionAmt(account: ExchangeAccount, symbol: string): Promi
   try {
     const pos = (await signed(account, "GET", "/fapi/v2/positionRisk", { symbol })) as Array<{
       positionAmt: string;
+      leverage?: string;
     }>;
     return Number(pos[0]?.positionAmt ?? 0);
+  } catch {
+    return null;
+  }
+}
+
+async function asterSymbolLeverage(account: ExchangeAccount, symbol: string): Promise<number | null> {
+  try {
+    const pos = (await signed(account, "GET", "/fapi/v2/positionRisk", { symbol })) as Array<{
+      leverage?: string;
+    }>;
+    const n = Number(pos[0]?.leverage);
+    return Number.isFinite(n) && n > 0 ? n : null;
   } catch {
     return null;
   }
@@ -519,13 +532,18 @@ export const asterAdapter: ExchangeAdapter = {
         ? roundToStep(order.qty, spec.stepSize, spec.minQty)
         : Number(order.qty.toPrecision(6));
       if (!qty) return { ok: false, message: `Aster size below min for ${order.symbol}` };
+      const wantLev = capLeverage(order.leverage);
       try {
         await signed(account, "POST", "/fapi/v1/leverage", {
           symbol: order.symbol,
-          leverage: capLeverage(order.leverage),
+          leverage: wantLev,
         });
       } catch {
-        /* leverage may already be set */
+        /* read back below — never send size at a higher lev than asked */
+      }
+      const actualLev = await asterSymbolLeverage(account, order.symbol);
+      if (actualLev != null && actualLev > wantLev) {
+        return { ok: false, message: `Aster leverage ${actualLev}x over cap ${wantLev}x` };
       }
       const side = order.side === "long" ? "BUY" : "SELL";
       const closeSide = side === "BUY" ? "SELL" : "BUY";
