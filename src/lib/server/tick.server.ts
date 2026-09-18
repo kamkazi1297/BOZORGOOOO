@@ -3,7 +3,7 @@ import { FALLBACK_UNIVERSE, fetchUniverse, fetchVenueUniverse, filterByMinCap, m
 import { fetchVenueLastPrice } from "@/lib/market/venues";
 import { onlyClosedBars, scanBarClosed } from "@/lib/engine/run";
 import { parseEngineGates, parseSideGates, scanNames, isSideOn } from "@/lib/engine/engine-gates";
-import { origStopPx, pathExcursion, rebaseStopsFromFill, closeFromVenueTrades, sizePosition, walkPath, netClosePnl, netPnlR } from "@/lib/engine/paper";
+import { origStopPx, pathExcursion, rebaseStopsFromFill, closeFromVenueTrades, sizePosition, walkPath, netClosePnl, netPnlR, barsAfterFill } from "@/lib/engine/paper";
 import { capitalPctForLeverage, DEFAULT_CAPITAL_PCT, parseCapitalBase, parseLevSizeTiers } from "@/lib/engine/lev-size";
 import {
   barFillKey,
@@ -720,8 +720,10 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     const openedMs = new Date(pos.opened_at).getTime();
     const barTime = Number(pos.bar_time);
     const start = Number.isFinite(barTime) && barTime > 0 ? barTime + tfMs : openedMs;
-    let path = bars.filter((b) => b.time >= start - 2000);
-    if (!path.length) path = [bars[bars.length - 1]!];
+    const path = Number.isFinite(barTime) && barTime > 0
+      ? barsAfterFill(bars, barTime, tfMs)
+      : bars.filter((b) => b.time >= start - 2000);
+    if (!path.length) continue;
     const walked = walkPath({
       side,
       entry,
@@ -964,7 +966,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   const deadline = t0 + tickBudgetMs();
   let scannedCoins = 0;
   let tried = 0;
-  const lastN = live ? 1 : scanLastN(opts.source);
+  const lastN = scanLastN(opts.source);
   const finished = new Set<string>();
 
   if (Date.now() + 1_500 < deadline) {
@@ -1108,7 +1110,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     let skip = "";
     const coin = fillCoin(s.symbol);
     const barKey = barFillKey(s.symbol, s.timeframe, s.barTime);
-    const stale = (live || opts.source !== "manual") && !isFreshSignal(s.barTime, s.timeframe, Date.now());
+    const stale = !isFreshSignal(s.barTime, s.timeframe, Date.now());
     skip = skipFill({
       stale,
       sideOn: isSideOn(sideGates, s.indicator, s.side),

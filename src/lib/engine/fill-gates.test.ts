@@ -69,6 +69,21 @@ describe("fill gates — one coin, one candle, one fill", () => {
     assert.equal(remainingSlots(4, 2, 1), 2);
   });
 
+  it("blocks a stale candle the same way in paper and live", () => {
+    assert.equal(
+      skipFill({
+        stale: true,
+        coin: "BTC",
+        barKey: "BTC|15m|1",
+        held: new Set(),
+        filledBars: new Set(),
+        used: 0,
+        remaining: 4,
+      }),
+      "stale bar",
+    );
+  });
+
   it("does not send a live order when the wallet or book was not read", () => {
     assert.equal(
       skipFill({

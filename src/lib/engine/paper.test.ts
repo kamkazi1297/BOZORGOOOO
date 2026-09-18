@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { closeFromVenueTrades, netClosePnl, pathExcursion, rebaseStopsFromFill, sizePosition, walkPath } from "./paper.ts";
+import { barsAfterFill, closeFromVenueTrades, netClosePnl, pathExcursion, rebaseStopsFromFill, sizePosition, walkPath } from "./paper.ts";
 import type { Bar } from "./types.ts";
 
 function bar(i: number, o: Partial<Bar> = {}): Bar {
@@ -15,6 +15,24 @@ function bar(i: number, o: Partial<Bar> = {}): Bar {
     ...o,
   };
 }
+
+describe("barsAfterFill — wait for the next closed candle", () => {
+  it("does not use the signal candle as an exit path", () => {
+    const tf = 5 * 60_000;
+    const t0 = Date.UTC(2024, 0, 1);
+    const signal = bar(0);
+    const next = bar(1, { high: 111, close: 110 });
+    assert.deepEqual(
+      barsAfterFill([signal, next], t0, tf).map((b) => b.time),
+      [next.time],
+    );
+  });
+  it("returns empty while the next candle is still forming — leave the trade open", () => {
+    const tf = 5 * 60_000;
+    const t0 = Date.UTC(2024, 0, 1);
+    assert.equal(barsAfterFill([bar(0)], t0, tf).length, 0);
+  });
+});
 
 describe("walkPath — SL/TP across missed ticks", () => {
   it("closes on an older 5m bar even if the latest bar never tagged SL", () => {

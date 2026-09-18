@@ -87,6 +87,19 @@ export function pathExit(side: Side, sl: number, tp: number, bar: Bar): "sl" | "
   return null;
 }
 
+/**
+ * Bars that can resolve a paper fill: strictly after the signal candle.
+ * Never the signal bar itself — that would instant-close on the entry candle.
+ * Empty means the next candle is still forming; leave the trade open.
+ */
+export function barsAfterFill(bars: Bar[], barTime: number, tfMs: number): Bar[] {
+  const t = Number(barTime);
+  const ms = Number(tfMs);
+  if (!Number.isFinite(t) || t <= 0 || !Number.isFinite(ms) || ms <= 0) return [];
+  const start = t + ms;
+  return bars.filter((b) => Number.isFinite(b.time) && b.time >= start - 2000);
+}
+
 export type PathHit = {
   reason: "sl" | "tp" | "be";
   exit: number;

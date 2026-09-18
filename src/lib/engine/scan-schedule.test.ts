@@ -103,11 +103,12 @@ describe("isFreshSignal", () => {
 });
 
 describe("scanLastN / per-TF cursor", () => {
-  it("cron looks at exactly one closed bar", () => {
+  it("paper and live look at exactly one closed bar", () => {
     assert.equal(scanLastN("cloudflare"), 1);
     assert.equal(scanLastN("backup"), 1);
     assert.equal(scanLastN("watchdog"), 1);
-    assert.equal(scanLastN("manual"), 4);
+    assert.equal(scanLastN("manual"), 1);
+    assert.equal(scanLastN(undefined), 1);
   });
   it("resets a TF cursor when that TF has a new closed bar", () => {
     const close = Date.UTC(2026, 0, 1, 12, 5, 0);

@@ -9,6 +9,7 @@ export const CRON_STALE_MS = 90_000;
  * How long after a bar's close we still accept a fill.
  * Window is the rest of the next bar of that TF so a 200-coin book can
  * finish across 1-minute cron pings (Vercel ~10s/tick ≈ 30–40 coins).
+ * Paper and live use the same window — no backfill of older candles.
  */
 export const FRESH_MS: Record<Timeframe, number> = {
   "5m": TF_MS["5m"] - 3_000,
@@ -111,7 +112,7 @@ export function barCloseTime(barOpen: number, tfMs: number): number {
 
 /**
  * Cron: only TFs whose latest closed bar is still fresh and not fully swept.
- * Manual: every TF (operator asked for a scan now).
+ * Manual: every TF (operator asked for a scan now) — fills still require freshness.
  */
 export function dueTimeframes(now: number, scanDone: ScanDone, source?: string): Timeframe[] {
   if (!source || source === "manual") return SCAN_TFS.slice();
@@ -126,9 +127,8 @@ export function dueTimeframes(now: number, scanDone: ScanDone, source?: string):
   });
 }
 
-/** Cron only inspects the just-closed bar. Manual may look back a few. */
-export function scanLastN(source?: string): number {
-  if (!source || source === "manual") return 4;
+/** Paper and live both inspect only the just-closed bar. Never backfill. */
+export function scanLastN(_source?: string): number {
   return 1;
 }
 
