@@ -14,6 +14,7 @@ import { fmtPct, fmtR, fmtUsd, millionsToUsd, usdToMillions } from "@/lib/utils"
 import { CRON_STALE_MS } from "@/lib/engine/scan-schedule";
 import { bookVenue, chartHostLabel, venueLabel } from "@/lib/exchanges/meta";
 import { DEFAULT_CAPITAL_PCT, DEFAULT_LEV_SIZE_TIERS, capitalPctForLeverage, type CapitalBase } from "@/lib/engine/lev-size";
+import { countHtfOpen } from "@/lib/engine/fill-gates";
 
 export const Route = createFileRoute("/")({
   loader: () => getDesk(),
@@ -34,6 +35,7 @@ function Home() {
   const [capitalBase, setCapitalBase] = useState<CapitalBase>(s.capitalBase === "free" ? "free" : "total");
   const [batch, setBatch] = useState(String(s.scanBatch ?? 0));
   const [maxPos, setMaxPos] = useState(String(s.maxPositions ?? 4));
+  const [htfMaxPos, setHtfMaxPos] = useState(String(s.htfMaxPositions ?? 4));
   const [maxLev, setMaxLev] = useState(String(s.maxLeverage ?? 200));
   const [stackCount, setStackCount] = useState(String(s.stackLevCount ?? 2));
   const [stackCap, setStackCap] = useState(String(s.stackLevCap ?? 75));
@@ -46,12 +48,13 @@ function Home() {
     setCapitalBase(s.capitalBase === "free" ? "free" : "total");
     setBatch(String(s.scanBatch ?? 0));
     setMaxPos(String(s.maxPositions ?? 4));
+    setHtfMaxPos(String(s.htfMaxPositions ?? 4));
     setMaxLev(String(s.maxLeverage ?? 200));
     setStackCount(String(s.stackLevCount ?? 2));
     setStackCap(String(s.stackLevCap ?? 75));
     setTiers(s.levSizeTiers ?? DEFAULT_LEV_SIZE_TIERS);
     setMinCap(String(usdToMillions(s.minMarketCapUsd)));
-  }, [s.capitalPct, s.capitalBase, s.scanBatch, s.maxPositions, s.maxLeverage, s.stackLevCount, s.stackLevCap, s.levSizeTiers, s.minMarketCapUsd]);
+  }, [s.capitalPct, s.capitalBase, s.scanBatch, s.maxPositions, s.htfMaxPositions, s.maxLeverage, s.stackLevCount, s.stackLevCap, s.levSizeTiers, s.minMarketCapUsd]);
   const pnl = Number(data.stats.pnl);
   const curve = data.equity.map((e) => ({
     t: new Date(e.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
@@ -69,6 +72,7 @@ function Home() {
           capital_base: capitalBase,
           scan_batch: Math.min(250, Math.max(0, Math.round(Number(batch) || 0))),
           max_positions: Math.min(20, Math.max(1, Math.round(Number(maxPos) || 4))),
+          htf_max_positions: Math.min(20, Math.max(0, Math.round(Number(htfMaxPos) || 0))),
           max_leverage: Math.min(200, Math.max(1, Math.round(Number(maxLev) || 200))),
           stack_lev_count: Math.min(20, Math.max(0, Math.round(Number(stackCount) || 0))),
           stack_lev_cap: Math.min(200, Math.max(1, Math.round(Number(stackCap) || 75))),
@@ -80,6 +84,7 @@ function Home() {
       setCapitalBase(saved.capitalBase === "free" ? "free" : "total");
       setBatch(String(saved.scanBatch ?? batch));
       setMaxPos(String(saved.maxPositions ?? maxPos));
+      setHtfMaxPos(String(saved.htfMaxPositions ?? htfMaxPos));
       setMaxLev(String(saved.maxLeverage ?? maxLev));
       setStackCount(String(saved.stackLevCount ?? stackCount));
       setStackCap(String(saved.stackLevCap ?? stackCap));
@@ -282,7 +287,15 @@ function Home() {
             value={fmtUsd(s.equityUsd, 0)}
             hint={`${t.free} ${fmtUsd(s.availableUsd ?? s.equityUsd, 0)} · ${t.locked} ${fmtUsd(Math.max(0, s.equityUsd - (s.availableUsd ?? s.equityUsd)), 0)}`}
           />
-          <Kpi label={t.open} value={String(data.stats.open)} hint={`max ${s.maxPositions}`} />
+          <Kpi
+            label={t.open}
+            value={String(data.stats.open)}
+            hint={
+              Number(s.htfMaxPositions) > 0
+                ? `max ${s.maxPositions} · 1h/4h ${countHtfOpen(data.open.map((p) => p.timeframe))}/${s.htfMaxPositions}`
+                : `max ${s.maxPositions}`
+            }
+          />
           <Kpi
             label={t.winRate}
             value={fmtPct(data.stats.winRate)}
@@ -491,6 +504,37 @@ function Home() {
                 ))}
               </div>
               <p className="text-xs text-subtle">{t.maxPosHint}</p>
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor="desk-htfmax">{t.htfMaxPos}</Label>
+              <Input
+                id="desk-htfmax"
+                type="number"
+                min={0}
+                max={20}
+                step={1}
+                value={htfMaxPos}
+                disabled={!unlocked || saving}
+                onChange={(e) => setHtfMaxPos(e.target.value)}
+              />
+              <div className="flex flex-wrap gap-1">
+                {[0, 2, 3, 4, 6].map((n) => (
+                  <button
+                    key={n}
+                    type="button"
+                    disabled={!unlocked || saving}
+                    onClick={() => setHtfMaxPos(String(n))}
+                    className={`min-h-8 rounded-sm border px-2 text-xs ${
+                      Number(htfMaxPos) === n
+                        ? "border-accent bg-surface-2 text-fg"
+                        : "border-border text-muted hover:border-border-strong"
+                    } disabled:opacity-40`}
+                  >
+                    {n === 0 ? (locale === "fa" ? "خاموش" : "off") : n}
+                  </button>
+                ))}
+              </div>
+              <p className="text-xs text-subtle">{t.htfMaxPosHint}</p>
             </div>
             <div className="flex items-end">
               <Button className="w-full" onClick={saveSizing} disabled={!unlocked || saving}>

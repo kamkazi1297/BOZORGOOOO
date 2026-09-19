@@ -53,6 +53,9 @@ export const copy = {
       "اگر این تعداد معامله با اهرمی بالاتر از سقف دوم همزمان باز باشد، معاملهٔ بعدی حداکثر با همان سقف دوم باز می‌شود. ۰ = این قانون خاموش.",
     maxPos: "حداکثر همزمان",
     maxPosHint: "سقف معاملهٔ باز. یک ارز = یک پوزیشن. یک کندل = یک معامله، حتی اگر چند موتور با هم سیگنال بدهند.",
+    htfMaxPos: "سقف ۱س + ۴س",
+    htfMaxPosHint:
+      "حداکثر چند معاملهٔ یک‌ساعته و چهارساعته با هم باز باشند. اسلات باقی‌مانده برای ۵د و ۱۵د می‌ماند. ۰ = این سقف خاموش.",
     minCap: "حداقل مارکت‌کپ",
     minCapHint: "۰ = همه ارزهای صرافی. واحد: میلیون دلار (۸۰۰ یعنی هشتصد میلیون).",
     minCapAll: "همه",
@@ -222,6 +225,9 @@ export const copy = {
       "If this many open trades already have leverage above the second cap, the next fill uses that cap. 0 = off.",
     maxPos: "Max concurrent",
     maxPosHint: "Open-trade cap. One coin = one position. One candle = one fill, even if several engines fire together.",
+    htfMaxPos: "Max 1h + 4h",
+    htfMaxPosHint:
+      "Cap on 1-hour and 4-hour trades together so leftover slots stay free for 5m/15m. 0 = off.",
     minCap: "Min market cap",
     minCapHint: "0 = every coin on the venue. Unit: USD millions (800 = $800M).",
     minCapAll: "All",

@@ -17,6 +17,7 @@ export type SettingsRow = {
   stack_lev_count?: number | null;
   stack_lev_cap?: number | null;
   max_positions: number;
+  htf_max_positions?: number | null;
   min_market_cap_usd: number;
   equity_usd: number;
   starting_equity_usd: number;
@@ -105,6 +106,7 @@ export function publicSettings(row: SettingsRow, opts?: { unlocked?: boolean }) 
     levSizeTiers: parseLevSizeTiers(row.lev_size_tiers),
     capitalBase: parseCapitalBase(row.capital_base),
     maxPositions: num(row.max_positions, 4),
+    htfMaxPositions: Math.min(20, Math.max(0, Math.round(num(row.htf_max_positions, 4)))),
     minMarketCapUsd: num(row.min_market_cap_usd, 0),
     equityUsd: num(row.equity_usd, 10000),
     availableUsd: num(row.equity_usd, 10000),
@@ -190,6 +192,7 @@ async function ensureTickHardeningColumns(sql: Awaited<ReturnType<typeof getSql>
     "alter table desk_settings add column if not exists stack_lev_cap integer not null default 75",
     "alter table desk_settings add column if not exists lev_size_tiers text not null default '[{\"leverage\":5,\"capitalPct\":15},{\"leverage\":10,\"capitalPct\":12},{\"leverage\":25,\"capitalPct\":6}]'",
     "alter table desk_settings add column if not exists capital_base text not null default 'total'",
+    "alter table desk_settings add column if not exists htf_max_positions integer not null default 4",
     "alter table desk_settings alter column capital_pct set default 3",
     "alter table desk_settings alter column venue set default 'aster'",
   ];
@@ -268,6 +271,7 @@ export type SettingsPatch = Partial<{
   lev_size_tiers: string;
   capital_base: string;
   max_positions: number;
+  htf_max_positions: number;
   min_market_cap_usd: number;
   equity_usd: number;
   starting_equity_usd: number;
@@ -302,6 +306,7 @@ export async function patchSettings(patch: SettingsPatch) {
     "lev_size_tiers",
     "capital_base",
     "max_positions",
+    "htf_max_positions",
     "min_market_cap_usd",
     "equity_usd",
     "starting_equity_usd",

@@ -3,8 +3,10 @@ import { describe, it } from "node:test";
 import {
   barFillKey,
   concurrentOpenCount,
+  countHtfOpen,
   fillCoin,
   heldCoins,
+  isHtfTf,
   leverageOverCap,
   marginOverBudget,
   remainingSlots,
@@ -97,6 +99,30 @@ describe("fill gates — one coin, one candle, one fill", () => {
       }),
       "live balance unread — not sending",
     );
+  });
+
+  it("caps 1h+4h together so 5m/15m can still fill leftover slots", () => {
+    const base = {
+      coin: "ETH",
+      barKey: "ETH|1h|1",
+      held: new Set<string>(),
+      filledBars: new Set<string>(),
+      used: 4,
+      remaining: 6,
+      htfMax: 4,
+      htfOpen: 4,
+    };
+    assert.equal(skipFill({ ...base, htf: true }), "htf cap");
+    assert.equal(skipFill({ ...base, htf: false, barKey: "ETH|15m|1" }), "");
+    assert.equal(skipFill({ ...base, htf: true, htfOpen: 3 }), "");
+    assert.equal(skipFill({ ...base, htf: true, htfMax: 0 }), "");
+  });
+
+  it("counts only 1h and 4h as slow trades", () => {
+    assert.equal(isHtfTf("1h"), true);
+    assert.equal(isHtfTf("4h"), true);
+    assert.equal(isHtfTf("15m"), false);
+    assert.equal(countHtfOpen(["5m", "1h", "15m", "4h", "1h"]), 3);
   });
 });
 

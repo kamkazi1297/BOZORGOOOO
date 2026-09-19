@@ -13,6 +13,9 @@ import {
   marginOverBudget,
   remainingSlots as slotsLeft,
   skipFill,
+  countHtfOpen,
+  clampHtfMaxPositions,
+  isHtfTf,
 } from "@/lib/engine/fill-gates";
 import { FEE_BPS, HTF2_OF, HTF_OF, TF_MS, WARMUP, type KlineTf, type Timeframe, type VenueId } from "@/lib/engine/types";
 import {
@@ -1086,6 +1089,8 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   signals = found.length;
   const remainingSlots = slotsLeft(settings.max_positions, stillOpen.length, venueBook?.length ?? 0);
   let used = 0;
+  const htfMax = clampHtfMaxPositions(settings.htf_max_positions);
+  let htfOpen = countHtfOpen(stillOpen.map((p) => p.timeframe));
   const capitalPctDefault = Number(settings.capital_pct) || DEFAULT_CAPITAL_PCT;
   const capitalBase = parseCapitalBase(settings.capital_base);
   const levSizeTiers = parseLevSizeTiers(settings.lev_size_tiers);
@@ -1120,6 +1125,9 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
       filledBars,
       used,
       remaining: remainingSlots,
+      htf: isHtfTf(s.timeframe),
+      htfOpen,
+      htfMax,
       liveUnread:
         live && (!liveBalReady || !liveBookReady)
           ? !liveBalReady
@@ -1358,6 +1366,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
             openLevs.push(Math.min(fillLev, lev));
             used += 1;
             opened += 1;
+            if (isHtfTf(s.timeframe)) htfOpen += 1;
             usedMargin += fillMargin;
             available = Math.max(0, available - fillMargin);
             taken = true;

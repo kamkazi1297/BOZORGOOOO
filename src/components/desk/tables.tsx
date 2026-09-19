@@ -122,6 +122,7 @@ function skipLabel(reason: string | null, fa: boolean) {
   if (r === "stale bar") return fa ? "کندل قدیمی" : "old bar";
   if (r === "already in symbol") return fa ? "همین ارز باز است" : "already in symbol";
   if (r === "max positions") return fa ? "سقف پوزیشن" : "max positions";
+  if (r === "htf cap") return fa ? "سقف ۱س و ۴س" : "1h/4h cap";
   if (r === "already filled") return fa ? "قبلاً گرفته شد" : "already filled";
   if (r === "already on venue") return fa ? "روی صرافی باز است" : "already on venue";
   if (r === "leverage over cap") return fa ? "اهرم بالاتر از سقف" : "leverage over cap";

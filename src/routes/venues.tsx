@@ -33,6 +33,7 @@ function Page() {
   const [stackCap, setStackCap] = useState(String(s.stackLevCap ?? 75));
   const [tiers, setTiers] = useState(s.levSizeTiers ?? DEFAULT_LEV_SIZE_TIERS);
   const [maxPos, setMaxPos] = useState(String(s.maxPositions));
+  const [htfMaxPos, setHtfMaxPos] = useState(String(s.htfMaxPositions ?? 4));
   const [equity, setEquity] = useState(String(s.equityUsd));
   const [batch, setBatch] = useState(String(s.scanBatch ?? 0));
   const [minCap, setMinCap] = useState(String(usdToMillions(s.minMarketCapUsd)));
@@ -65,6 +66,7 @@ function Page() {
     setStackCap(String(s.stackLevCap ?? 75));
     setTiers(s.levSizeTiers ?? DEFAULT_LEV_SIZE_TIERS);
     setMaxPos(String(s.maxPositions ?? 4));
+    setHtfMaxPos(String(s.htfMaxPositions ?? 4));
     setEquity(String(s.equityUsd));
     setBatch(String(s.scanBatch ?? 0));
     setMinCap(String(usdToMillions(s.minMarketCapUsd)));
@@ -80,6 +82,7 @@ function Page() {
     s.stackLevCap,
     s.levSizeTiers,
     s.maxPositions,
+    s.htfMaxPositions,
     s.equityUsd,
     s.scanBatch,
     s.minMarketCapUsd,
@@ -103,6 +106,7 @@ function Page() {
           stack_lev_cap: Math.min(200, Math.max(1, Math.round(Number(stackCap) || 75))),
           lev_size_tiers: tiers,
           max_positions: Math.min(20, Math.max(1, Math.round(Number(maxPos) || 4))),
+          htf_max_positions: Math.min(20, Math.max(0, Math.round(Number(htfMaxPos) || 0))),
           equity_usd: Number(equity),
           scan_batch: Math.min(250, Math.max(0, Math.round(Number(batch) || 0))),
           min_market_cap_usd: millionsToUsd(Number(minCap) || 0),
@@ -127,6 +131,7 @@ function Page() {
       setStackCap(String(saved.stackLevCap ?? stackCap));
       setTiers(saved.levSizeTiers ?? tiers);
       setMaxPos(String(saved.maxPositions ?? maxPos));
+      setHtfMaxPos(String(saved.htfMaxPositions ?? htfMaxPos));
       setBatch(String(saved.scanBatch ?? batch));
       setMinCap(String(usdToMillions(saved.minMarketCapUsd)));
       setEquity(String(saved.equityUsd ?? equity));
@@ -368,6 +373,35 @@ function Page() {
             onChange={(e) => setMaxPos(e.target.value)}
           />
           <p className="text-xs text-subtle">{t.maxPosHint}</p>
+        </div>
+        <div className="grid gap-1.5">
+          <Label>{t.htfMaxPos}</Label>
+          <Input
+            type="number"
+            min={0}
+            max={20}
+            value={htfMaxPos}
+            disabled={!unlocked}
+            onChange={(e) => setHtfMaxPos(e.target.value)}
+          />
+          <div className="flex flex-wrap gap-1">
+            {[0, 2, 3, 4, 6].map((n) => (
+              <button
+                key={n}
+                type="button"
+                disabled={!unlocked}
+                onClick={() => setHtfMaxPos(String(n))}
+                className={`min-h-8 rounded-sm border px-2 text-xs ${
+                  Number(htfMaxPos) === n
+                    ? "border-accent bg-surface-2 text-fg"
+                    : "border-border text-muted hover:border-border-strong"
+                } disabled:opacity-40`}
+              >
+                {n === 0 ? (fa ? "خاموش" : "off") : n}
+              </button>
+            ))}
+          </div>
+          <p className="text-xs text-subtle">{t.htfMaxPosHint}</p>
         </div>
         <div className="grid gap-1.5">
           <Label>{locale === "fa" ? "ارز در هر تیک (۰ = همه)" : "Coins per tick (0 = all)"}</Label>
