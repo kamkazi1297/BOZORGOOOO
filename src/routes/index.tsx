@@ -176,6 +176,58 @@ function Home() {
           </Button>
         </div>
 
+
+      <div className="mt-4 grid gap-3 rounded-lg border-2 border-accent bg-surface p-4">
+        <div>
+          <h2 className="text-base font-medium">{t.capitalBase}</h2>
+          <div className="mt-2 grid grid-cols-2 gap-2 sm:max-w-md">
+            {(["total", "free"] as const).map((base) => (
+              <button
+                key={base}
+                type="button"
+                disabled={!unlocked}
+                onClick={() => setCapitalBase(base)}
+                className={`min-h-11 rounded-sm border px-3 text-sm ${
+                  capitalBase === base ? "border-accent bg-surface-2 text-fg" : "border-border text-muted"
+                } disabled:opacity-40`}
+              >
+                {base === "total" ? t.capitalBaseTotal : t.capitalBaseFree}
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 text-xs leading-relaxed text-muted">{t.capitalBaseHint}</p>
+        </div>
+        <div className="grid gap-1.5 sm:max-w-xs">
+          <Label>{t.htfMaxPos}</Label>
+          <Input
+            type="number"
+            min={0}
+            max={20}
+            step={1}
+            value={htfMaxPos}
+            disabled={!unlocked}
+            onChange={(e) => setHtfMaxPos(e.target.value)}
+          />
+          <div className="flex flex-wrap gap-1">
+            {[0, 2, 3, 4, 6].map((n) => (
+              <button
+                key={n}
+                type="button"
+                disabled={!unlocked}
+                onClick={() => setHtfMaxPos(String(n))}
+                className={`min-h-8 rounded-sm border px-2 text-xs ${
+                  Number(htfMaxPos) === n ? "border-accent bg-surface-2 text-fg" : "border-border text-muted"
+                } disabled:opacity-40`}
+              >
+                {n === 0 ? (locale === "fa" ? "خاموش" : "off") : n}
+              </button>
+            ))}
+          </div>
+          <p className="text-xs leading-relaxed text-muted">{t.htfMaxPosHint}</p>
+        </div>
+      </div>
+
+
         <div className="grid gap-3 sm:grid-cols-3">
           {[
             {
