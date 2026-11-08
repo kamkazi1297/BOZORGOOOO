@@ -628,97 +628,66 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     if (live && adapter && pos.mode === "live") {
       const vs = venueSymbol(venue, pos.symbol);
       const side = pos.side as "long" | "short";
-      const slNow = Number(pos.sl);
+      const deskSl = Number(pos.sl);
       const tpNow = Number(pos.tp);
       const qtyNow = Number(pos.qty);
-      let skipBe = false;
+      const entryPx = Number(pos.entry);
+      // Venue stop stays the signal stop. Never the entry — a mark tick there is a fee, not a BE.
+      const venueSl = origStopPx({
+        side,
+        entry: entryPx,
+        sl: deskSl,
+        origSl: pos.orig_sl,
+        qty: pos.qty,
+        risk: pos.risk_usd,
+      });
       try {
-        const prot = await adapter.fetchProtection(acc, { symbol: vs, sl: slNow, tp: tpNow });
-        if (!prot.unknown && !prot.onVenue) {
-          skipBe = true;
-        } else if (!prot.unknown && prot.onVenue && (!prot.hasSl || !prot.hasTp)) {
-          let restored = false;
+        const prot = await adapter.fetchProtection(acc, { symbol: vs, sl: venueSl, tp: tpNow });
+        const deskAtEntry = Math.abs(deskSl - entryPx) <= 1e-8 * Math.max(1, entryPx);
+        const restoreOrig = deskAtEntry && Math.abs(venueSl - entryPx) > 1e-8 * Math.max(1, entryPx);
+        if (!prot.unknown && prot.onVenue && (restoreOrig || !prot.hasSl || !prot.hasTp)) {
           try {
-            const placed = await adapter.updateStop(acc, {
+            await adapter.updateStop(acc, {
               symbol: vs,
               side,
-              sl: slNow,
+              sl: venueSl,
               tp: tpNow,
               qty: qtyNow,
             });
-            if (placed.ok) {
-              const again = await adapter.fetchProtection(acc, { symbol: vs, sl: slNow, tp: tpNow });
-              restored = !again.unknown && again.hasSl && again.hasTp;
+            if (restoreOrig) {
+              try {
+                await updatePositionSl(pos.id, venueSl);
+              } catch {
+                /* desk catches up next tick */
+              }
             }
           } catch {
-            restored = false;
-          }
-          if (!restored) {
-            const res = await adapter.closePosition(acc, vs);
-            if (res.ok || res.message === "flat") {
-              let exitPx = Number(pos.entry);
-              try {
-                const last = await fetchVenueLastPrice(venue, pos.symbol);
-                if (Number.isFinite(last)) exitPx = last;
-              } catch {
-                /* keep entry */
-              }
-              const resolved = await resolveLiveExit(adapter, acc, venue, pos, exitPx);
-              const holdMs = Math.max(0, Date.now() - new Date(pos.opened_at).getTime());
-              await closePosition(pos.id, resolved.exit, "unprotected", resolved.pnl, resolved.pnlR, {
-                holdMs,
-                beMoved: false,
-                feesUsd: resolved.fees,
-              });
-              closed += 1;
-              continue;
-            }
-            skipBe = true;
+            /* retry next tick — do not flatten at entry because the stop read blipped */
           }
         }
       } catch {
         /* next tick retries protection */
       }
-      if (!skipBe) {
-      const bars = lastBars.get(pos.symbol);
-      const last = bars?.[bars.length - 1];
-      const beAtR = trexBeAtR(pos.indicator);
-      if (last && beAtR) {
-        const entry = Number(pos.entry);
-        const origPx = origStopPx({
+    }
+    const rawBars = lastBars.get(pos.symbol);
+    if (!rawBars?.length) continue;
+    const livePos = Boolean(live && adapter && pos.mode === "live");
+    // Live exits on a finished 5m candle, same wick rule as paper. The forming bar is noise.
+    const bars = livePos ? onlyClosedBars(rawBars, "5m") : rawBars;
+    if (!bars.length) continue;
+    const side = pos.side as "long" | "short";
+    const entry = Number(pos.entry);
+    const deskSl = Number(pos.sl);
+    let slNow = livePos
+      ? origStopPx({
           side,
           entry,
-          sl: slNow,
+          sl: deskSl,
           origSl: pos.orig_sl,
           qty: pos.qty,
           risk: pos.risk_usd,
-        });
-        const dist = Math.abs(entry - origPx);
-        const alreadyBe = Math.abs(slNow - entry) <= 1e-8 * Math.max(1, entry);
-        const fav = side === "long" ? last.close - entry : entry - last.close;
-        if (!alreadyBe && dist > 0 && fav >= beAtR * dist) {
-          try {
-            const res = await adapter.updateStop(acc, {
-              symbol: vs,
-              side,
-              sl: entry,
-              tp: tpNow,
-              qty: qtyNow,
-            });
-            if (res.ok) await updatePositionSl(pos.id, entry);
-          } catch {
-            /* keep original stop on desk and venue */
-          }
-        }
-      }
-      }
-      continue;
-    }
-    const bars = lastBars.get(pos.symbol);
-    if (!bars?.length) continue;
-    const side = pos.side as "long" | "short";
-    const entry = Number(pos.entry);
-    let slNow = Number(pos.sl);
+        })
+      : deskSl;
     const tpNow = Number(pos.tp);
     const tf = (pos.timeframe as Timeframe) in TF_MS ? (pos.timeframe as Timeframe) : "5m";
     const tfMs = TF_MS[tf];
@@ -738,6 +707,10 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
       beAtR: trexBeAtR(pos.indicator),
     });
     if (walked.beMoved && Math.abs(walked.sl - slNow) > 1e-12) {
+      const atEntry = Math.abs(walked.sl - entry) <= 1e-8 * Math.max(1, entry);
+      // TREX BE is applied inside walkPath on the closed candle. Do not rest that stop
+      // on the venue — one tick back through entry would flatten before the target.
+      if (!(livePos && atEntry)) {
       let venueOk = true;
       if (live && adapter && pos.mode === "live") {
         try {
@@ -760,6 +733,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         } catch {
           /* keep original stop */
         }
+      }
       }
     }
     const reason = walked.hit?.reason ?? null;

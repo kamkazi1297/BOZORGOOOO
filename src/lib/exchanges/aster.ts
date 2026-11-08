@@ -264,7 +264,7 @@ async function asterPlaceStops(
       type: "STOP_MARKET",
       stopPrice: sl,
       closePosition: "true",
-      workingType: "MARK_PRICE",
+      workingType: "CONTRACT_PRICE",
     });
   } catch (err) {
     slErr = err instanceof Error ? err.message : "SL rejected";
@@ -276,7 +276,7 @@ async function asterPlaceStops(
       type: "TAKE_PROFIT_MARKET",
       stopPrice: tp,
       closePosition: "true",
-      workingType: "MARK_PRICE",
+      workingType: "CONTRACT_PRICE",
     });
   } catch (err) {
     tpErr = err instanceof Error ? err.message : "TP rejected";
@@ -665,7 +665,7 @@ export const asterAdapter: ExchangeAdapter = {
         type: "STOP_MARKET",
         stopPrice: sl,
         closePosition: "true",
-        workingType: "MARK_PRICE",
+        workingType: "CONTRACT_PRICE",
       });
       for (const orderId of oldStopIds) {
         try {
@@ -683,7 +683,7 @@ export const asterAdapter: ExchangeAdapter = {
           type: "TAKE_PROFIT_MARKET",
           stopPrice: tp,
           closePosition: "true",
-          workingType: "MARK_PRICE",
+          workingType: "CONTRACT_PRICE",
         });
         for (const o of tpOrders) {
           try {
@@ -759,10 +759,29 @@ export const asterAdapter: ExchangeAdapter = {
     if (amt == null) return { onVenue: false, hasSl: false, hasTp: false, unknown: true };
     const onVenue = amt !== 0;
     try {
-      const opens = (await signed(account, "GET", "/fapi/v1/openOrders", { symbol: input.symbol })) as Array<{
-        type?: string;
-        origType?: string;
-      }>;
+      const loadOpens = async () =>
+        (await signed(account, "GET", "/fapi/v1/openOrders", { symbol: input.symbol })) as Array<{
+          orderId?: number;
+          type?: string;
+          origType?: string;
+          workingType?: string;
+        }>;
+      let opens = await loadOpens();
+      const markAlgo = opens.some((o) => {
+        const typ = `${o.type ?? ""} ${o.origType ?? ""}`.toUpperCase();
+        const algo = typ.includes("TAKE_PROFIT") || isStopType(o.type ?? "", o.origType ?? "");
+        return algo && String(o.workingType ?? "").toUpperCase() === "MARK_PRICE";
+      });
+      // A mark trigger on a thin book fills at entry. Rewrite those stops onto contract price.
+      if (onVenue && markAlgo && input.sl > 0 && input.tp > 0) {
+        try {
+          const closeSide = amt > 0 ? "SELL" : "BUY";
+          await asterReplaceStops(account, input.symbol, closeSide, input.sl, input.tp);
+          opens = await loadOpens();
+        } catch {
+          /* next tick retries; leave the existing stop in place */
+        }
+      }
       let hasSl = false;
       let hasTp = false;
       for (const o of opens) {
