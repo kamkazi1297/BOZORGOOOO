@@ -7,11 +7,12 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input, Label, Select } from "@/components/ui/field";
 import { VENUE_META } from "@/lib/exchanges/meta";
-import { getDesk, saveDeskSettings, testVenue } from "@/lib/server/functions";
+import { getDesk, saveDeskSettings, testTelegram, testVenue } from "@/lib/server/functions";
 import { useLocale } from "@/lib/locale";
 import type { VenueId } from "@/lib/engine/types";
 import { millionsToUsd, usdToMillions } from "@/lib/utils";
 import { DEFAULT_CAPITAL_PCT, DEFAULT_LEV_SIZE_TIERS, type CapitalBase } from "@/lib/engine/lev-size";
+import { stringifyTelegramVenues, type TelegramVenueMap } from "@/lib/telegram";
 
 export const Route = createFileRoute("/venues")({
   loader: () => getDesk(),
@@ -49,6 +50,9 @@ function Page() {
   const [ourbitSec, setOurbitSec] = useState("");
   const [hlPk, setHlPk] = useState("");
   const [hlAddr, setHlAddr] = useState("");
+  const [tgToken, setTgToken] = useState("");
+  const [tgChat, setTgChat] = useState(s.telegramChatId ?? "");
+  const [tgVenues, setTgVenues] = useState<TelegramVenueMap>(s.telegramVenues);
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -72,6 +76,8 @@ function Page() {
     setMinCap(String(usdToMillions(s.minMarketCapUsd)));
     setBot(s.botEnabled);
     setLive(s.liveEnabled);
+    setTgChat(s.telegramChatId ?? "");
+    setTgVenues(s.telegramVenues);
   }, [
     s.mode,
     s.venue,
@@ -88,6 +94,8 @@ function Page() {
     s.minMarketCapUsd,
     s.botEnabled,
     s.liveEnabled,
+    s.telegramChatId,
+    s.telegramVenues,
   ]);
 
   async function save() {
@@ -122,6 +130,9 @@ function Page() {
           ourbit_api_secret: ourbitSec || undefined,
           hyperliquid_private_key: hlPk || undefined,
           hyperliquid_wallet_address: hlAddr || undefined,
+          telegram_bot_token: tgToken || undefined,
+          telegram_chat_id: tgChat.trim(),
+          telegram_venues: stringifyTelegramVenues(tgVenues),
         },
       });
       setCapital(String(saved.capitalPct ?? capital));
@@ -147,6 +158,9 @@ function Page() {
       setOurbitSec("");
       setHlPk("");
       setHlAddr("");
+      setTgToken("");
+      setTgChat(saved.telegramChatId ?? "");
+      setTgVenues(saved.telegramVenues);
       setMsg(t.saved);
       await router.invalidate({ sync: true });
     } catch (e) {
@@ -215,6 +229,31 @@ function Page() {
       setTestMsg((m) => ({
         ...m,
         [id]: { ok: false, text: e instanceof Error ? e.message : "test failed" },
+      }));
+    } finally {
+      setTesting(null);
+    }
+  }
+
+  async function pingTelegram(id: VenueId) {
+    setTesting(`tg:${id}`);
+    setErr(null);
+    try {
+      await saveDeskSettings({
+        data: {
+          telegram_bot_token: tgToken || undefined,
+          telegram_chat_id: tgChat.trim(),
+          telegram_venues: stringifyTelegramVenues(tgVenues),
+        },
+      });
+      setTgToken("");
+      const res = await testTelegram({ data: { venue: id } });
+      setTestMsg((m) => ({ ...m, [`tg:${id}`]: { ok: res.ok, text: res.message } }));
+      await router.invalidate({ sync: true });
+    } catch (e) {
+      setTestMsg((m) => ({
+        ...m,
+        [`tg:${id}`]: { ok: false, text: e instanceof Error ? e.message : "telegram failed" },
       }));
     } finally {
       setTesting(null);
@@ -622,6 +661,85 @@ function Page() {
             ) : null}
           </div>
         </fieldset>
+      </div>
+
+      <div className="mt-6 rounded-lg border border-border bg-surface p-4 shadow-panel">
+        <h2 className="text-base font-medium">{fa ? "تلگرام" : "Telegram"}</h2>
+        <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted">
+          {fa
+            ? "برای هر صرافی که تیکش روشن باشد، سیگنال جدید همان صرافی به کانال می‌رود. چت خالی یعنی همان کانال بالا. سیگنال تکراری دوباره فرستاده نمی‌شود. اسکن، ورود و خروج دست نمی‌خورند."
+            : "Each venue with the box on posts its new signals to Telegram. An empty chat uses the channel above. Duplicates are not sent again. Scan, entry and exit logic stay the same."}
+        </p>
+        <p className="mt-1 text-xs text-subtle">
+          {s.hasTelegram
+            ? fa
+              ? `توکن ذخیره شده ${s.telegramTokenHint || ""}`.trim()
+              : `Token saved ${s.telegramTokenHint || ""}`.trim()
+            : fa
+              ? "توکن هنوز ذخیره نشده"
+              : "No bot token saved"}
+        </p>
+        <div className="mt-3 grid gap-2 sm:grid-cols-2">
+          <Input
+            placeholder={fa ? "توکن ربات از BotFather" : "Bot token from BotFather"}
+            type="password"
+            value={tgToken}
+            disabled={!unlocked}
+            onChange={(e) => setTgToken(e.target.value)}
+            autoComplete="off"
+          />
+          <Input
+            placeholder={fa ? "چت کانال: @channel یا -100…" : "Channel: @channel or -100…"}
+            value={tgChat}
+            disabled={!unlocked}
+            onChange={(e) => setTgChat(e.target.value)}
+            autoComplete="off"
+          />
+        </div>
+        <div className="mt-3 grid gap-2">
+          {VENUE_META.map((v) => {
+            const pref = tgVenues[v.id] ?? { on: false, chatId: "" };
+            const pingKey = `tg:${v.id}`;
+            return (
+              <div key={v.id} className="grid items-center gap-2 rounded-sm border border-border p-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
+                <label className="flex min-h-11 items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={pref.on}
+                    disabled={!unlocked}
+                    onChange={(e) =>
+                      setTgVenues((prev) => ({
+                        ...prev,
+                        [v.id]: { ...prev[v.id], on: e.target.checked },
+                      }))
+                    }
+                  />
+                  {v.label}
+                  <span className="text-xs text-muted">{fa ? "ارسال سیگنال" : "send signals"}</span>
+                </label>
+                <Input
+                  placeholder={fa ? "چت اختصاصی، اختیاری" : "Own chat, optional"}
+                  value={pref.chatId}
+                  disabled={!unlocked}
+                  onChange={(e) =>
+                    setTgVenues((prev) => ({
+                      ...prev,
+                      [v.id]: { ...prev[v.id], chatId: e.target.value },
+                    }))
+                  }
+                />
+                <Button variant="outline" disabled={!unlocked || testing === pingKey} onClick={() => pingTelegram(v.id)}>
+                  {testing === pingKey ? "…" : fa ? "تست" : "Test"}
+                </Button>
+                {testMsg[pingKey] ? (
+                  <span className={`text-xs sm:col-span-3 ${testMsg[pingKey].ok ? "text-long" : "text-short"}`}>
+                    {testMsg[pingKey].text}
+                  </span>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
       </div>
 
       <div className="mt-6 flex items-center gap-3">

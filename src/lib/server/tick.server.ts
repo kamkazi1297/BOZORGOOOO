@@ -63,6 +63,8 @@ import {
   type PositionRow,
   type SettingsRow,
 } from "./desk.server";
+import { notifySignalsTelegram } from "./telegram.server";
+import type { TelegramSignal } from "@/lib/telegram";
 import { trexBeAtR } from "@/lib/engine/trex";
 
 const SCAN_BARS = 360;
@@ -1100,6 +1102,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   const stackCap = Math.min(200, Math.max(1, Math.round(Number(settings.stack_lev_cap) || 75)));
   const levMemo = new Map<string, number>();
   const openLevs = stillOpen.map((p) => Number(p.leverage) || 0);
+  const pendingTelegram: TelegramSignal[] = [];
 
   async function coinMaxLev(sym: string) {
     let n = levMemo.get(sym);
@@ -1461,7 +1464,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
       }
     }
     try {
-      await insertSignal({
+      const saved = await insertSignal({
         barTime: s.barTime,
         symbol: s.symbol,
         timeframe: s.timeframe,
@@ -1476,8 +1479,31 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         taken,
         skipReason: skip || undefined,
       });
+      if (saved.created) {
+        pendingTelegram.push({
+          symbol: s.symbol,
+          timeframe: s.timeframe,
+          indicator: s.indicator,
+          side: s.side,
+          entry: s.entry,
+          sl: s.sl,
+          tp: s.tp,
+          rr: s.rr,
+          reason: s.reason,
+          taken,
+          skip: skip || "",
+        });
+      }
     } catch {
       /* schema mismatch must not abort the rest of the tick */
+    }
+  }
+
+  if (pendingTelegram.length) {
+    try {
+      await notifySignalsTelegram(settings, venue, pendingTelegram);
+    } catch {
+      /* a telegram outage must not change the tick */
     }
   }
 

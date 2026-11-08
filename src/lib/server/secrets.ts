@@ -9,6 +9,7 @@ export const SECRET_SETTING_KEYS = [
   "ourbit_api_key",
   "ourbit_api_secret",
   "hyperliquid_private_key",
+  "telegram_bot_token",
 ] as const;
 
 export type SecretSettingKey = (typeof SECRET_SETTING_KEYS)[number];

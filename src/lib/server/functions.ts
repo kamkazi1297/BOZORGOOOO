@@ -28,7 +28,9 @@ import {
 import { lockOperator, lockStatus, requireOperator, setOperatorPin, unlockOperator } from "./lock.server";
 import { bookVenue, getAdapter } from "@/lib/exchanges/registry";
 import { stringifyLevSizeTiers } from "@/lib/engine/lev-size";
+import { isTelegramChatId, isTelegramToken, parseTelegramVenues, stringifyTelegramVenues } from "@/lib/telegram";
 import { accountFrom, clearUniverseCache, overlayLiveSnapshot, refreshUniverse, runTick } from "./tick.server";
+import { sendTelegramTest } from "./telegram.server";
 
 export const getDesk = createServerFn({ method: "GET" }).handler(async () => {
   await maybeSeedJournal();
@@ -145,6 +147,9 @@ export const saveDeskSettings = createServerFn({ method: "POST" })
       hyperliquid_private_key: z.string().nullable().optional(),
       hyperliquid_wallet_address: z.string().nullable().optional(),
       engine_gates: z.string().max(8000).optional(),
+      telegram_bot_token: z.string().max(200).nullable().optional(),
+      telegram_chat_id: z.string().max(64).nullable().optional(),
+      telegram_venues: z.string().max(2000).optional(),
     }),
   )
   .handler(async ({ data }) => {
@@ -153,10 +158,38 @@ export const saveDeskSettings = createServerFn({ method: "POST" })
       throw new Error("Paper is simulation only. Pick Hyperliquid, Lighter, Aster, or OURBIT for live fills.");
     }
     const before = await getSettings();
-    const { lev_size_tiers, ...rest } = data;
-    const patch: typeof rest & { lev_size_tiers?: string } = { ...rest };
+    const { lev_size_tiers, telegram_bot_token, telegram_chat_id, telegram_venues, ...rest } = data;
+    const patch: typeof rest & {
+      lev_size_tiers?: string;
+      telegram_bot_token?: string | null;
+      telegram_chat_id?: string | null;
+      telegram_venues?: string;
+    } = { ...rest };
     if (lev_size_tiers !== undefined) {
       patch.lev_size_tiers = stringifyLevSizeTiers(lev_size_tiers);
+    }
+    if (telegram_bot_token != null && telegram_bot_token.trim()) {
+      if (!isTelegramToken(telegram_bot_token)) {
+        throw new Error("توکن ربات تلگرام اشتباه است. همان متن BotFather را بچسبان.");
+      }
+      patch.telegram_bot_token = telegram_bot_token.trim();
+    }
+    if (telegram_chat_id != null) {
+      const chat = telegram_chat_id.trim();
+      if (chat && !isTelegramChatId(chat)) {
+        throw new Error("چت آیدی کانال باید @channel یا عدد باشد، مثل -1001234567890.");
+      }
+      patch.telegram_chat_id = chat;
+    }
+    if (telegram_venues != null) {
+      const prefs = parseTelegramVenues(telegram_venues);
+      for (const id of Object.keys(prefs) as Array<keyof typeof prefs>) {
+        const chat = prefs[id].chatId;
+        if (chat && !isTelegramChatId(chat)) {
+          throw new Error(`چت اختصاصی ${id} باید @channel یا عدد -100… باشد.`);
+        }
+      }
+      patch.telegram_venues = stringifyTelegramVenues(prefs);
     }
     const inferred: VenueId | undefined = data.venue
       ? data.venue
@@ -274,6 +307,13 @@ export const testVenue = createServerFn({ method: "POST" })
       }
     }
     return res;
+  });
+
+export const testTelegram = createServerFn({ method: "POST" })
+  .validator(z.object({ venue: z.enum(["paper", "hyperliquid", "lighter", "aster", "ourbit"]) }))
+  .handler(async ({ data }) => {
+    await requireOperator();
+    return sendTelegramTest(await getSettings(), data.venue);
   });
 
 export const getJournal = createServerFn({ method: "GET" }).handler(async () => {
