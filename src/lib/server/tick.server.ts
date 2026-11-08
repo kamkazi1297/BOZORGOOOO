@@ -3,7 +3,7 @@ import { FALLBACK_UNIVERSE, fetchUniverse, fetchVenueUniverse, filterByMinCap, m
 import { fetchVenueLastPrice } from "@/lib/market/venues";
 import { onlyClosedBars, scanBarClosed } from "@/lib/engine/run";
 import { parseEngineGates, parseSideGates, scanNames, isSideOn } from "@/lib/engine/engine-gates";
-import { origStopPx, pathExcursion, rebaseStopsFromFill, closeFromVenueTrades, sizePosition, walkPath, netClosePnl, netPnlR, barsAfterFill } from "@/lib/engine/paper";
+import { origStopPx, pathExcursion, rebaseStopsFromFill, closeFromVenueTrades, sizePosition, walkPath, netClosePnl, netPnlR, barsAfterFill, liveFillReverted } from "@/lib/engine/paper";
 import { capitalPctForLeverage, DEFAULT_CAPITAL_PCT, parseCapitalBase, parseLevSizeTiers } from "@/lib/engine/lev-size";
 import {
   barFillKey,
@@ -739,7 +739,19 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     const reason = walked.hit?.reason ?? null;
     if (reason) {
       const why = reason;
+      const paperExit = walked.hit!.exit;
       if (live && adapter && pos.mode === "live") {
+        let last = paperExit;
+        try {
+          const px = await fetchVenueLastPrice(venue, pos.symbol);
+          if (Number.isFinite(px) && px > 0) last = px;
+        } catch {
+          /* if the last price is unread, do not market-flatten at a guess */
+          continue;
+        }
+        // Wick tagged the paper level and came back to entry. Leave the resting
+        // limit stop; a market close here is the fee loop, not the paper result.
+        if (liveFillReverted({ entry, exit: paperExit, last })) continue;
         try {
           const res = await adapter.closePosition(acc, venueSymbol(venue, pos.symbol));
           if (!res.ok) continue;

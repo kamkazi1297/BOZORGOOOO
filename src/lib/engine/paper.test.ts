@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { barsAfterFill, closeFromVenueTrades, netClosePnl, pathExcursion, rebaseStopsFromFill, sizePosition, walkPath } from "./paper.ts";
+import { barsAfterFill, closeFromVenueTrades, liveFillReverted, netClosePnl, pathExcursion, rebaseStopsFromFill, sizePosition, walkPath } from "./paper.ts";
 import type { Bar } from "./types.ts";
 
 function bar(i: number, o: Partial<Bar> = {}): Bar {
@@ -15,6 +15,19 @@ function bar(i: number, o: Partial<Bar> = {}): Bar {
     ...o,
   };
 }
+
+describe("liveFillReverted — do not flatten a wick back at entry", () => {
+  it("is reverted when price is back at entry after the paper stop was tagged", () => {
+    assert.equal(liveFillReverted({ entry: 0.3225, exit: 0.3253, last: 0.3226 }), true);
+  });
+  it("is not reverted when price is still at the paper stop or target", () => {
+    assert.equal(liveFillReverted({ entry: 10.474, exit: 10.59, last: 10.58 }), false);
+    assert.equal(liveFillReverted({ entry: 10.474, exit: 9.2, last: 9.21 }), false);
+  });
+  it("does not treat a break-even exit as reverted", () => {
+    assert.equal(liveFillReverted({ entry: 10.474, exit: 10.474, last: 10.48 }), false);
+  });
+});
 
 describe("barsAfterFill — wait for the next closed candle", () => {
   it("does not use the signal candle as an exit path", () => {

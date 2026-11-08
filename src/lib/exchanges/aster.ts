@@ -248,39 +248,99 @@ async function waitAsterFlat(account: ExchangeAccount, symbol: string): Promise<
   return last === 0 ? "flat" : "open";
 }
 
+function triggerNow(msg: string) {
+  return /trigger/i.test(msg);
+}
+
+async function asterProtectQty(account: ExchangeAccount, symbol: string, hinted?: number) {
+  const specs = await loadSpecs();
+  const spec = specs.find((s) => s.symbol === symbol);
+  const amt = await asterPositionAmt(account, symbol);
+  const raw = amt != null && amt !== 0 ? Math.abs(amt) : Number(hinted ?? 0);
+  if (!(raw > 0)) return 0;
+  return spec ? roundToStep(raw, spec.stepSize, spec.minQty) : Number(raw.toPrecision(8));
+}
+
+/**
+ * Rest the paper exit on the book.
+ * STOP / TAKE_PROFIT limit at that exact price, so a thin-book print cannot
+ * fill the close back at entry. STOP_MARKET is only the fallback if the limit
+ * type is rejected — never a flatten of a fresh fill.
+ */
+async function asterPlaceOneProtect(
+  account: ExchangeAccount,
+  symbol: string,
+  closeSide: "BUY" | "SELL",
+  kind: "sl" | "tp",
+  price: number,
+  qty: number,
+): Promise<string> {
+  const limitType = kind === "sl" ? "STOP" : "TAKE_PROFIT";
+  const marketType = kind === "sl" ? "STOP_MARKET" : "TAKE_PROFIT_MARKET";
+  const tag = kind === "sl" ? "psl" : "ptp";
+  const clientId = (salt: string) => `${tag}${salt}`.slice(0, 36);
+  if (qty > 0) {
+    try {
+      await signed(account, "POST", "/fapi/v1/order", {
+        symbol,
+        side: closeSide,
+        type: limitType,
+        quantity: qty,
+        price,
+        stopPrice: price,
+        timeInForce: "GTC",
+        reduceOnly: "true",
+        workingType: "CONTRACT_PRICE",
+        newClientOrderId: clientId(`a${Date.now()}`),
+      });
+      return "";
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "rejected";
+      if (triggerNow(msg)) {
+        try {
+          await signed(account, "POST", "/fapi/v1/order", {
+            symbol,
+            side: closeSide,
+            type: "LIMIT",
+            quantity: qty,
+            price,
+            timeInForce: "GTC",
+            reduceOnly: "true",
+            newClientOrderId: clientId(`b${Date.now()}`),
+          });
+          return "";
+        } catch {
+          /* market algo below still protects */
+        }
+      }
+    }
+  }
+  try {
+    await signed(account, "POST", "/fapi/v1/order", {
+      symbol,
+      side: closeSide,
+      type: marketType,
+      stopPrice: price,
+      closePosition: "true",
+      workingType: "CONTRACT_PRICE",
+    });
+    return "";
+  } catch (err) {
+    return err instanceof Error ? err.message : "rejected";
+  }
+}
+
 async function asterPlaceStops(
   account: ExchangeAccount,
   symbol: string,
   closeSide: "BUY" | "SELL",
   sl: number,
   tp: number,
+  qtyHint?: number,
 ): Promise<{ slErr: string; tpErr: string }> {
-  let slErr = "";
-  let tpErr = "";
-  try {
-    await signed(account, "POST", "/fapi/v1/order", {
-      symbol,
-      side: closeSide,
-      type: "STOP_MARKET",
-      stopPrice: sl,
-      closePosition: "true",
-      workingType: "CONTRACT_PRICE",
-    });
-  } catch (err) {
-    slErr = err instanceof Error ? err.message : "SL rejected";
-  }
-  try {
-    await signed(account, "POST", "/fapi/v1/order", {
-      symbol,
-      side: closeSide,
-      type: "TAKE_PROFIT_MARKET",
-      stopPrice: tp,
-      closePosition: "true",
-      workingType: "CONTRACT_PRICE",
-    });
-  } catch (err) {
-    tpErr = err instanceof Error ? err.message : "TP rejected";
-  }
+  const qty = await asterProtectQty(account, symbol, qtyHint);
+  const slErr = await asterPlaceOneProtect(account, symbol, closeSide, "sl", sl, qty);
+  const tpErr = await asterPlaceOneProtect(account, symbol, closeSide, "tp", tp, qty);
   return { slErr, tpErr };
 }
 
@@ -291,6 +351,7 @@ async function asterReplaceStops(
   closeSide: "BUY" | "SELL",
   sl: number,
   tp: number,
+  qtyHint?: number,
 ): Promise<{ slErr: string; tpErr: string }> {
   let oldIds: number[] = [];
   try {
@@ -301,7 +362,7 @@ async function asterReplaceStops(
   } catch {
     /* still place the new pair */
   }
-  const placed = await asterPlaceStops(account, symbol, closeSide, sl, tp);
+  const placed = await asterPlaceStops(account, symbol, closeSide, sl, tp, qtyHint);
   if (!placed.slErr && !placed.tpErr) {
     for (const orderId of oldIds) {
       try {
@@ -591,7 +652,7 @@ export const asterAdapter: ExchangeAdapter = {
       let sl = spec ? roundPrice(rebased.sl, spec.tickSize) : rebased.sl;
       let tp = spec ? roundPrice(rebased.tp, spec.tickSize) : rebased.tp;
 
-      let { slErr, tpErr } = await asterPlaceStops(account, order.symbol, closeSide, sl, tp);
+      let { slErr, tpErr } = await asterPlaceStops(account, order.symbol, closeSide, sl, tp, filledQty);
       if (slErr || tpErr) {
         const missing = [slErr && `SL: ${slErr}`, tpErr && `TP: ${tpErr}`].filter(Boolean).join(" · ");
         const oid = data.orderId ? String(data.orderId) : undefined;
@@ -622,7 +683,7 @@ export const asterAdapter: ExchangeAdapter = {
           const sl2 = spec ? roundPrice(later.sl, spec.tickSize) : later.sl;
           const tp2 = spec ? roundPrice(later.tp, spec.tickSize) : later.tp;
           if (Math.abs(sl2 - sl) > 1e-8 || Math.abs(tp2 - tp) > 1e-8) {
-            const moved = await asterReplaceStops(account, order.symbol, closeSide, sl2, tp2);
+            const moved = await asterReplaceStops(account, order.symbol, closeSide, sl2, tp2, filledQty);
             if (!moved.slErr && !moved.tpErr) {
               sl = sl2;
               tp = tp2;
@@ -650,51 +711,15 @@ export const asterAdapter: ExchangeAdapter = {
       const spec = specs.find((s) => s.symbol === order.symbol);
       const sl = spec ? roundPrice(order.sl, spec.tickSize) : order.sl;
       const tp = spec ? roundPrice(order.tp, spec.tickSize) : order.tp;
-      const opens = (await signed(account, "GET", "/fapi/v1/openOrders", { symbol: order.symbol })) as Array<{
-        orderId: number;
-        type?: string;
-        origType?: string;
-        stopPrice?: string;
-      }>;
-      const oldStopIds = opens.filter((o) => isStopType(o.type ?? "", o.origType ?? "")).map((o) => o.orderId);
-      const tpOrders = opens.filter((o) => `${o.type ?? ""} ${o.origType ?? ""}`.toUpperCase().includes("TAKE_PROFIT"));
       const closeSide = order.side === "long" ? "SELL" : "BUY";
-      await signed(account, "POST", "/fapi/v1/order", {
-        symbol: order.symbol,
-        side: closeSide,
-        type: "STOP_MARKET",
-        stopPrice: sl,
-        closePosition: "true",
-        workingType: "CONTRACT_PRICE",
-      });
-      for (const orderId of oldStopIds) {
-        try {
-          await signed(account, "DELETE", "/fapi/v1/order", { symbol: order.symbol, orderId });
-        } catch {
-          /* new BE stop is live; leftover old stop is safer than a gap */
-        }
+      const placed = await asterReplaceStops(account, order.symbol, closeSide, sl, tp, order.qty);
+      if (placed.slErr || placed.tpErr) {
+        const missing = [placed.slErr && `SL: ${placed.slErr}`, placed.tpErr && `TP: ${placed.tpErr}`]
+          .filter(Boolean)
+          .join(" · ");
+        return { ok: false, message: missing || "Aster update stop failed" };
       }
-      const restingTp = Number(tpOrders[0]?.stopPrice ?? 0);
-      const tpMoved = Number.isFinite(tp) && tp > 0 && (!restingTp || Math.abs(restingTp - tp) > 1e-8);
-      if (tpMoved) {
-        await signed(account, "POST", "/fapi/v1/order", {
-          symbol: order.symbol,
-          side: closeSide,
-          type: "TAKE_PROFIT_MARKET",
-          stopPrice: tp,
-          closePosition: "true",
-          workingType: "CONTRACT_PRICE",
-        });
-        for (const o of tpOrders) {
-          try {
-            await signed(account, "DELETE", "/fapi/v1/order", { symbol: order.symbol, orderId: o.orderId });
-          } catch {
-            /* new TP is live */
-          }
-        }
-        return { ok: true, message: "Aster SL/TP moved onto live fill" };
-      }
-      return { ok: true, message: "Aster SL moved to BE · TP kept" };
+      return { ok: true, message: "Aster SL/TP at paper price" };
     } catch (err) {
       return { ok: false, message: err instanceof Error ? err.message : "Aster update stop failed" };
     }
@@ -765,15 +790,21 @@ export const asterAdapter: ExchangeAdapter = {
           type?: string;
           origType?: string;
           workingType?: string;
+          clientOrderId?: string;
         }>;
       let opens = await loadOpens();
-      const markAlgo = opens.some((o) => {
+      const needsPaperLimit = opens.some((o) => {
         const typ = `${o.type ?? ""} ${o.origType ?? ""}`.toUpperCase();
         const algo = typ.includes("TAKE_PROFIT") || isStopType(o.type ?? "", o.origType ?? "");
-        return algo && String(o.workingType ?? "").toUpperCase() === "MARK_PRICE";
+        if (!algo) return false;
+        // Mark trigger and market-stop both fill a thin book back at entry.
+        return (
+          String(o.workingType ?? "").toUpperCase() === "MARK_PRICE" ||
+          typ.includes("STOP_MARKET") ||
+          typ.includes("TAKE_PROFIT_MARKET")
+        );
       });
-      // A mark trigger on a thin book fills at entry. Rewrite those stops onto contract price.
-      if (onVenue && markAlgo && input.sl > 0 && input.tp > 0) {
+      if (onVenue && needsPaperLimit && input.sl > 0 && input.tp > 0) {
         try {
           const closeSide = amt > 0 ? "SELL" : "BUY";
           await asterReplaceStops(account, input.symbol, closeSide, input.sl, input.tp);
@@ -786,8 +817,9 @@ export const asterAdapter: ExchangeAdapter = {
       let hasTp = false;
       for (const o of opens) {
         const typ = `${o.type ?? ""} ${o.origType ?? ""}`.toUpperCase();
-        if (typ.includes("TAKE_PROFIT")) hasTp = true;
-        else if (isStopType(o.type ?? "", o.origType ?? "")) hasSl = true;
+        const cid = String(o.clientOrderId ?? "").toLowerCase();
+        if (typ.includes("TAKE_PROFIT") || cid.startsWith("ptp")) hasTp = true;
+        else if (isStopType(o.type ?? "", o.origType ?? "") || cid.startsWith("psl")) hasSl = true;
       }
       return { onVenue, hasSl, hasTp, unknown: false };
     } catch {

@@ -248,6 +248,21 @@ export function rebaseStopsFromFill(opts: {
   return { sl: opts.sl + d, tp: opts.tp + d };
 }
 
+/**
+ * Live market-close guard. True when the last price is closer to entry than to
+ * the paper stop/target — a thin-book wick already reverted, and a market
+ * flatten would book a fee instead of the paper exit. Break-even (exit == entry)
+ * is not reverted; that exit is the entry on purpose.
+ */
+export function liveFillReverted(opts: { entry: number; exit: number; last: number }) {
+  const entry = Number(opts.entry);
+  const exit = Number(opts.exit);
+  const last = Number(opts.last);
+  if (!(entry > 0) || !(exit > 0) || !(last > 0)) return false;
+  if (Math.abs(exit - entry) <= 1e-8 * Math.max(1, entry)) return false;
+  return Math.abs(last - exit) > Math.abs(last - entry);
+}
+
 export type VenueTradeLite = {
   time: number;
   side: string;
